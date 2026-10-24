@@ -19,9 +19,6 @@ Rollback path: disarm() or delete the state file; disarmed is a no-op.
 
 Env vars:
   KILL_SWITCH_LIMIT_USDT   default arm limit suggestion (default: 100)
-
-Design note: JARVIS/design/session-kill-switch-panel-design.md
-Runbook:     JARVIS/ops/kill-switch-runbook.md
 """
 
 from __future__ import annotations

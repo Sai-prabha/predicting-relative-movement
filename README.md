@@ -80,9 +80,13 @@ You need Python 3.12, Node.js 22 and network access to `api.binance.com` and `st
 
 The server defaults to strategy version v4.15. `python start_model_server.py --model-version v4.18` runs another version with the same model weights (choices: v4.15, v4.16, v4.17, v4.18).
 
+The server also starts a background strategy-research scheduler (daily at 04:30 UTC, with a deeper scan on Saturdays). Set `RESEARCH_AUTO=0` to turn it off.
+
 ### Optional: Binance Futures testnet
 
 Copy `binance-env.sh.example` to `binance-env.sh`, which git ignores, and fill in testnet keys from https://testnet.binancefuture.com. Then run `source binance-env.sh && python start_model_server.py`. The file also lists the safety settings: dry-run mode, per-order quantity caps and the symbol allowlist. Creating `data/live/KILL_SWITCH` blocks all orders without a restart.
+
+Auto-execute starts off and is switched on from the dashboard's broker panel. A local server only auto-executes on the testnet when `EXECUTION_WRITER=1` is also exported. Without it the server runs as an observer, and the dashboard says so.
 
 ## Run the tests
 
@@ -106,12 +110,15 @@ api/                       FastAPI model server and everything it imports
   feature_calculator.py    the 50 live features and the signal generators
   version_config.py        strategy versions v4.15 to v4.18
   broker_client.py         testnet broker, paper broker, order safety gate
+  broker_config.py         persisted broker settings
   execution_guards.py      pre-trade guards (stale data, exposure caps)
   kill_switch.py           session max-loss switch
   execution_control.py     single-writer auto-execute control with audit trail
+  ops_audit.py             reader for the audit logs
+  trade_stats.py           per-side trade statistics
   reconciliation.py        broker fill ingest and PnL attribution
   microstructure_*.py      order-book and trade-tape capture (off by default locally)
-  strategy_lab.py, simulation_lab.py, timing_advisor.py, ops_audit.py
+  strategy_lab.py, simulation_lab.py, timing_advisor.py
                            strategy research tooling added after submission
 FrontEnd/                  React + TypeScript dashboard (Vite)
 models/v4_14_production/   trained XGBoost weights, feature list, training config
@@ -127,7 +134,7 @@ start_model_server.py      server entry point
 
 ### Classification
 
-The shipped model's training run recorded these figures in `models/v4_14_production/config.json`. They come from a chronological hold-out, the last 34,767 bars of the training data, which was also used for early stopping. So they are not walk-forward results, and they lean slightly optimistic.
+The shipped model's training run recorded these figures in `models/v4_14_production/config.json`. They come from a chronological hold-out, the last 34,767 bars of the training data, which also set the number of trees through early stopping. The 50 features were selected on the full span, and the shipped weights were then refit on all of it, hold-out included. So these are not walk-forward results or out-of-sample figures for the shipped model, and they lean optimistic. The training script is not in this repository.
 
 | Metric | Value | Source |
 |---|---|---|
@@ -154,36 +161,7 @@ The signal's edge did not survive taker fees. In July 2026, after submission, `s
 | Average trade before fees | +0.035% | `scorecard.json:15` |
 | Average trade after fees | -0.145% | `scorecard.json:48` |
 
-## Design decisions
-
-*Draft notes, to be written up in my own words.*
-
-**Why predict 10 one-minute bars ahead?**
-- The label is the sign of the ratio's move over the next 10 bars (`k_ahead: 10`, `config.json:10`).
-- The live path recomputes the features on each new 1m candle and publishes a fresh P(up) each minute.
-- Later, fee-aware work found the v4.15 to v4.17 entries earned about +0.01% to +0.03% per trade, roughly ten times below the 0.18% round-trip cost. v4.18 trades only the probability tails and holds for up to 240 bars instead (`api/version_config.py:299-315`, `:365`).
-- Question for me: what drove the original choice of 10 bars (signal half-life, label noise, trade frequency)?
-
-**Why walk-forward validation?**
-- The data is a time series. Shuffled folds would train on bars that come after the bars being tested.
-- Every feature is a causal rolling window with a minimum period, max lookback 780 bars, so live values match the values computed over the full history (`scripts/fast_backtest.py:11-15`).
-- The later evaluations keep the same rule: tune on one window (Oct to Dec 2025), then check once on a later window (Dec 2025 to Jul 2026). See `scripts/fast_backtest.py:23-26`.
-- Question for me: fold layout and step size used in the dissertation.
-
-**Why these features?**
-- 50 selected by importance from a larger engineered set (`config.json`: `max_features: 50`).
-- Groups: 13 ratio rolling statistics, 10 trend, 8 buy/sell pressure from taker volume, 6 volatility regime and spread, 5 BTC-ETH correlation, 5 calendar and session, plus RSI, a lagged return and a return z-score. Names are in `models/v4_14_production/feature_names.json`.
-- Buy/sell pressure uses the taker-buy volume field in each Binance kline (`api/feature_calculator.py:97-106`).
-- Z-scores are clipped at 5 sigma. Rolling windows are 5, 10 and 30 bars short, and 60 and 120 long (`api/feature_calculator.py`, constants at the top).
-- The live calculator reproduces the training feature code so the model sees the same inputs live as in training. `scripts/fast_backtest.py --parity N` checks this.
-- Question for me: which feature families mattered most, and why the ratio rather than each coin separately?
-
-**Why a testnet, with a paper fallback?**
-- USDM futures let each leg be shorted, which a two-leg ratio position needs (short ratio = sell BTCUSDT + buy ETHUSDT, `tests/test_auto_exec_e2e.py`).
-- The testnet runs the real order path with no money at risk. The client refuses any other host (`api/broker_client.py:49`).
-- Without testnet keys (`BINANCE_ENV` not `demo`) the server uses `PaperBroker`, so the full signal-to-order path runs for anyone, and in the tests (`tests/test_broker_safety.py`).
-- Further rails: kill-switch file, dry-run mode, per-order caps, symbol allowlist (`binance-env.sh.example`).
-- Question for me: anything about the assessment setting that ruled out real funds?
+Only the trade count and the average trade are cited from the scorecard. Its `final_equity` and `max_drawdown_pct` fields come from the after-fee equity curve in both the gross and net blocks (`scripts/fast_backtest.py:368-370`), so they are not gross figures.
 
 ## Project timeline
 
@@ -194,9 +172,11 @@ The signal's edge did not survive taker fees. In July 2026, after submission, `s
 
 ## What is not included
 
-- The training pipeline and the training data. The model ships already trained, but this repository cannot retrain it.
+- The original training pipeline and the training data. The v4.14 model ships already trained, but this repository cannot reproduce it. `scripts/train_v4183.py` is a later experiment that trains a separate model on a 240-bar label.
 - The feed-forward network experiments.
 - Research logs and the full cost studies.
+
+The code still carries settings for a Railway and Vercel deployment that is no longer running. That is why the dashboard shows Railway and observer warnings when it runs locally.
 
 ## Licence
 
