@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets (copy binance-env.sh.example and keep the real file local)
+binance-env.sh
+.env
+.env.*
+
+# Runtime state written by the server, tests and backtests
+data/
+.model_server.pid
+*.log
+
+# Models other than the shipped production weights
+models/*
+!models/v4_14_production/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store

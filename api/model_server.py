@@ -1,0 +1,2838 @@
+"""
+FastAPI Model Server for Live Trading Signal Streaming.
+
+Supports version switching between strategy versions (v4.15, v4.16, etc.)
+via the MODEL_VERSION environment variable or --model-version CLI flag.
+
+Startup sequence:
+  1. Load serialized XGBClassifier from models/v4_14_production/
+  2. Instantiate the correct signal generator for the selected version
+  3. Restore portfolio state from persisted trade history
+  4. Fetch 1000 historical 1m candles (BTC + ETH) from REST API
+  5. Connect to WebSocket for live BTC + ETH 1m klines
+  6. On each closed candle: calculate features -> model.predict_proba() ->
+     hysteresis + circuit breaker + SL/TP -> stream signal to frontend via WS
+"""
+
+import asyncio
+import csv
+import json
+import logging
+import math
+import os
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+from contextlib import asynccontextmanager
+
+import secrets
+
+import bcrypt
+import numpy as np
+import requests
+import websockets
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from jose import JWTError, jwt
+from xgboost import XGBClassifier
+
+from .feature_calculator import V414FeatureCalculator, V414SignalGenerator, V416SignalGenerator
+from .trade_stats import compute_trade_stats
+from .version_config import get_strategy_config, list_versions, register_version
+from . import execution_control, microstructure_ingest, ops_audit, reconciliation, simulation_lab, strategy_lab, timing_advisor
+from .broker_client import (
+    JSONL_LOG_PATH,
+    BrokerClient,
+    OrderRequest,
+    OrderResponse,
+    _safety_limits,
+    make_broker_client,
+)
+from .broker_config import (
+    BrokerConfig,
+    apply_partial_update,
+    load_broker_config,
+    save_broker_config,
+)
+from .execution_guards import ExecutionGuards
+from .kill_switch import KillSwitch
+
+# ── Auth config (optional; set AUTH_REQUIRED=true on Railway for production) ──
+AUTH_REQUIRED = os.environ.get("AUTH_REQUIRED", "false").lower() == "true"
+ADMIN_USERNAME = "adm1nFYP"
+ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")
+# Production must supply JWT_SECRET; a random per-boot secret is only
+# acceptable when auth is off (dev), where tokens are decorative anyway.
+_jwt_secret_env = os.environ.get("JWT_SECRET", "")
+if not _jwt_secret_env and AUTH_REQUIRED:
+    raise RuntimeError(
+        "JWT_SECRET environment variable must be set when AUTH_REQUIRED=true. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
+JWT_SECRET = _jwt_secret_env or secrets.token_hex(32)
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = 24
+SUBSCRIBER_API_KEY = os.environ.get("SUBSCRIBER_API_KEY", "")
+
+
+# ── Numpy → native Python converter ───────────────────────────────────────
+
+def _sanitize_for_json(obj):
+    """Recursively convert numpy scalars/arrays to JSON-serializable Python types."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
+# ── Logging ────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ── Paths ──────────────────────────────────────────────────────────────────
+MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "v4_14_production"
+MODEL_PATH = MODEL_DIR / "model.json"
+FEATURE_NAMES_PATH = MODEL_DIR / "feature_names.json"
+CONFIG_PATH = MODEL_DIR / "config.json"
+
+# ── Trade persistence paths ──────────────────────────────────────────────
+LIVE_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "live"
+TRADE_HISTORY_JSON = LIVE_DATA_DIR / "trade_history.json"
+KILL_SWITCH_JSON = LIVE_DATA_DIR / "kill_switch.json"
+TRADE_HISTORY_CSV = LIVE_DATA_DIR / "trade_history.csv"
+# Append-only log of auto-execute events (one row on submit, one on
+# reconcile). Read back by GET /broker/executions, deduped by timestamp.
+EXEC_EVENTS_JSONL = LIVE_DATA_DIR / "exec_events.jsonl"
+# Broker history cache + sync cursor (reconciliation ingest — read-only).
+_recon_store = reconciliation.BrokerHistoryStore(LIVE_DATA_DIR)
+
+# ── Data API ──────────────────────────────────────────────────────────────
+REST_BASE = "https://api.binance.com/api/v3"
+WS_STREAM_BASE = "wss://stream.binance.com:9443/stream"
+WARMUP_CANDLES = 1000
+
+# ── Version selection ──────────────────────────────────────────────────────
+MODEL_VERSION = os.environ.get("MODEL_VERSION", "v4.15")
+
+# The env-configured version, frozen at boot. /model/promote may move
+# MODEL_VERSION at runtime; a mismatch between the two tells operators the
+# deployment env still needs updating for the promotion to survive a restart.
+CONFIGURED_MODEL_VERSION = MODEL_VERSION
+
+# Data freshness: candles are 1m — a last-processed candle older than this is
+# stale and every client (UI, monitors) gets told so explicitly.
+STALE_AFTER_SECONDS = int(os.environ.get("STALE_AFTER_SECONDS", "180"))
+
+# Append-only audit trail of runtime promotions (who went live, from what, when).
+PROMOTIONS_JSONL = LIVE_DATA_DIR / "promotions.jsonl"
+
+# Shadow candidate version — when set (and different from MODEL_VERSION), a
+# second signal generator runs side-by-side on the exact same probability
+# stream. It persists simulated trades to its own file and NEVER touches the
+# live trade history, portfolio state, or broker. Unset = feature off, zero
+# behavior change.
+SHADOW_MODEL_VERSION = os.environ.get("SHADOW_MODEL_VERSION", "").strip()
+if SHADOW_MODEL_VERSION == MODEL_VERSION:
+    SHADOW_MODEL_VERSION = ""
+
+# Shadow trades live in their own file, keyed by version, so the real
+# trade_history.json is never written by the shadow path.
+SHADOW_TRADES_JSON = (
+    LIVE_DATA_DIR / f"shadow_{SHADOW_MODEL_VERSION.replace('.', '_')}_trades.json"
+    if SHADOW_MODEL_VERSION else None
+)
+
+# ── Global state ───────────────────────────────────────────────────────────
+model: XGBClassifier = None
+feature_names: list = []
+config: dict = {}
+feature_calc: V414FeatureCalculator = None
+# signal_gen is typed as a union — both generators share the same .update() interface
+signal_gen = None  # V414SignalGenerator | V416SignalGenerator
+
+active_connections: Set[WebSocket] = set()
+
+# Track last known trade count for persistence
+_last_trade_count: int = 0
+
+# Anchors the baseline-vs-candidate matched comparison window when no shadow
+# trade exists yet (the window otherwise starts at the earliest shadow trade).
+_SERVER_STARTED_TS = time.time()
+
+# Shadow candidate generator (None unless SHADOW_MODEL_VERSION is set)
+shadow_signal_gen = None  # V414SignalGenerator | V416SignalGenerator
+shadow_model = None  # XGBClassifier with the shadow's OWN weights, or None (shares primary)
+_shadow_last_trade_count: int = 0
+_last_shadow_signal: Optional[Dict] = None
+
+# Broker integration state
+broker_client: Optional[BrokerClient] = None
+broker_config: Optional[BrokerConfig] = None
+# Last position the broker has been instructed to hold (-1, 0, +1).
+# Updated after every attempt so transient outages don't cause order storms.
+_broker_position: int = 0
+# Most recent auto-execute event — included in every WS broadcast after it fires.
+_last_execution_event: Optional[Dict] = None
+execution_guards: Optional[ExecutionGuards] = None
+kill_switch: Optional[KillSwitch] = None
+
+latest_signal_data: Dict = {
+    "timestamp": None,
+    "ratio": None,
+    "features": None,
+    "signal": None,
+    "data_quality": None,
+}
+
+
+# ── Trade persistence ────────────────────────────────────────────────────
+
+def _ensure_live_dir():
+    """Create data/live/ directory if it doesn't exist."""
+    LIVE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _persist_trade(trade: Dict):
+    """Append a single trade to JSON and CSV files."""
+    _ensure_live_dir()
+
+    # ── JSON append ──
+    trades = []
+    if TRADE_HISTORY_JSON.exists():
+        try:
+            with open(TRADE_HISTORY_JSON, "r") as f:
+                trades = json.load(f)
+        except (json.JSONDecodeError, Exception):
+            trades = []
+
+    trades.append(trade)
+    with open(TRADE_HISTORY_JSON, "w") as f:
+        json.dump(trades, f, indent=2, default=str)
+
+    # ── CSV append ──
+    csv_exists = TRADE_HISTORY_CSV.exists()
+    fieldnames = [
+        "direction", "entry_price", "exit_price", "entry_time", "exit_time",
+        "pnl_pct", "pnl_dollar", "bars_held", "position_size_pct",
+        "stop_loss", "take_profit", "entry_probability", "entry_strength", "reason",
+    ]
+    with open(TRADE_HISTORY_CSV, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if not csv_exists:
+            writer.writeheader()
+        writer.writerow(trade)
+
+    logger.info(f"Trade persisted: {trade['direction']} PnL={trade['pnl_pct']:.3f}%")
+
+
+def _persist_exec_event(event: Dict) -> None:
+    """Append an execution event snapshot to the JSONL history.
+
+    Called twice per event (on submit and after fill reconciliation); the
+    read path keeps the newest row per event timestamp. Never raises.
+    """
+    try:
+        _ensure_live_dir()
+        with open(EXEC_EVENTS_JSONL, "a") as f:
+            f.write(json.dumps(_sanitize_for_json(event), default=str) + "\n")
+    except Exception as e:
+        logger.warning(f"Exec event persist failed: {e}")
+
+
+def _read_jsonl_tail(path: Path, limit: int) -> list:
+    """Read up to ``limit`` newest valid JSON rows from a JSONL file.
+
+    Malformed lines are skipped — an interrupted write must not take the
+    whole history endpoint down. Returns rows oldest→newest.
+    """
+    if not path.exists():
+        return []
+    rows: list = []
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except Exception as e:
+        logger.warning(f"JSONL read failed ({path.name}): {e}")
+        return []
+    for line in lines[-max(limit * 3, limit):]:  # slack for dedup/filter passes
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def _make_signal_gen(version: str):
+    """Construct the signal generator for a version string.
+
+    Used for both the primary and the shadow generator so they are built
+    identically. v4.15 runs on the frozen V414SignalGenerator with production
+    config params; every other registered version runs on the config-driven
+    V416SignalGenerator. Unknown versions raise (fail fast).
+    """
+    if version == "v4.15":
+        strategy = config["strategy_params"]
+        return V414SignalGenerator(
+            entry_threshold=strategy["entry_threshold"],
+            exit_threshold=strategy["exit_threshold"],
+            min_hold=strategy["min_hold"],
+            cooldown=strategy["cooldown"],
+            cb_lookback=strategy["cb_lookback"],
+            cb_threshold=strategy["cb_threshold"],
+        )
+    return V416SignalGenerator(cfg=get_strategy_config(version))
+
+
+def _activate_shadow(version: str) -> None:
+    """(Re)build the shadow slot for a version: generator, persistence file,
+    counters. Used at boot (env or lab registration) and by the run-in-shadow
+    endpoint. The slot stays evaluation-only — nothing here touches the broker."""
+    global shadow_signal_gen, _shadow_last_trade_count, _last_shadow_signal
+    global SHADOW_MODEL_VERSION, SHADOW_TRADES_JSON, shadow_model
+    SHADOW_MODEL_VERSION = version
+    SHADOW_TRADES_JSON = LIVE_DATA_DIR / f"shadow_{version.replace('.', '_')}_trades.json"
+    shadow_signal_gen = _make_signal_gen(version)
+    _shadow_last_trade_count = 0
+    _last_shadow_signal = None
+    # Dual-model shadow: a candidate with its OWN weights ships them under
+    # models/<version with dots→underscores>/. When present (and trained on
+    # the identical feature set), the slot gets its own probability stream;
+    # otherwise it shares the primary's (decision-layer-only candidates).
+    shadow_model = None
+    shadow_dir = Path(__file__).resolve().parent.parent / "models" / version.replace(".", "_")
+    if (shadow_dir / "model.json").exists():
+        try:
+            fn_path = shadow_dir / "feature_names.json"
+            shadow_features = json.loads(fn_path.read_text()) if fn_path.exists() else None
+            if shadow_features != feature_names:
+                logger.warning(
+                    "  SHADOW model %s feature set differs from primary — "
+                    "own-weights disabled, sharing primary probas", version)
+            else:
+                m = XGBClassifier()
+                m.load_model(str(shadow_dir / "model.json"))
+                shadow_model = m
+                logger.info(f"  SHADOW own weights loaded: {shadow_dir / 'model.json'}")
+        except Exception as e:
+            logger.warning(f"  SHADOW model load failed ({e}); sharing primary probas")
+    if SHADOW_TRADES_JSON.exists():
+        try:
+            with open(SHADOW_TRADES_JSON, "r") as f:
+                shadow_trades = json.load(f)
+            if shadow_trades:
+                shadow_signal_gen.restore_from_trades(shadow_trades)
+                _shadow_last_trade_count = len(shadow_trades)
+        except Exception as e:
+            logger.warning(f"  Could not restore shadow trades: {e}")
+    logger.info(
+        f"  SHADOW mode: {version} "
+        f"({type(shadow_signal_gen).__name__}) → {SHADOW_TRADES_JSON}"
+    )
+
+
+def _deactivate_shadow() -> None:
+    """Empty the shadow slot (stop endpoint / promotion)."""
+    global shadow_signal_gen, _shadow_last_trade_count, _last_shadow_signal
+    global SHADOW_MODEL_VERSION, SHADOW_TRADES_JSON, shadow_model
+    shadow_model = None
+    shadow_signal_gen = None
+    SHADOW_MODEL_VERSION = ""
+    SHADOW_TRADES_JSON = None
+    _shadow_last_trade_count = 0
+    _last_shadow_signal = None
+
+
+# Broker-realistic cost model for shadow accounting: a ratio round trip is
+# 4 taker MARKET fills. Keeps the candidate comparison honest — shadow PnL
+# is reported net of the costs it WOULD have paid, not internal-ledger gross.
+SHADOW_FEE_BPS_PER_SIDE = float(os.environ.get("SHADOW_FEE_BPS_PER_SIDE", "4.5"))
+_SHADOW_RT_COST = 4 * SHADOW_FEE_BPS_PER_SIDE / 10_000.0
+
+
+def _apply_cost_model(trade: Dict) -> Dict:
+    """Stamp net-of-cost fields onto a closed trade dict (idempotent)."""
+    if "pnl_pct_net" in trade:
+        return trade
+    pnl_pct = float(trade.get("pnl_pct", 0.0) or 0.0)
+    pnl_dollar = float(trade.get("pnl_dollar", 0.0) or 0.0)
+    notional = abs(pnl_dollar / (pnl_pct / 100.0)) if pnl_pct else 0.0
+    fee = notional * _SHADOW_RT_COST
+    trade["fee_dollar"] = round(fee, 6)
+    trade["pnl_pct_net"] = round(pnl_pct - _SHADOW_RT_COST * 100.0, 6)
+    trade["pnl_dollar_net"] = round(pnl_dollar - fee, 6)
+    return trade
+
+
+def _net_view(trades: list) -> list:
+    """Trades with pnl fields replaced by their net-of-cost values, for stats."""
+    out = []
+    for t in trades:
+        t = _apply_cost_model(dict(t))
+        out.append({**t, "pnl_pct": t["pnl_pct_net"], "pnl_dollar": t["pnl_dollar_net"]})
+    return out
+
+
+def _check_and_persist_shadow_trades():
+    """Persist new shadow trades to the shadow-only JSON file (never the real history)."""
+    global _shadow_last_trade_count
+    if shadow_signal_gen is None or SHADOW_TRADES_JSON is None:
+        return
+    current = len(shadow_signal_gen.trades)
+    if current <= _shadow_last_trade_count:
+        return
+    _ensure_live_dir()
+    existing = []
+    if SHADOW_TRADES_JSON.exists():
+        try:
+            with open(SHADOW_TRADES_JSON, "r") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = []
+    existing.extend(_apply_cost_model(t) for t in shadow_signal_gen.trades[_shadow_last_trade_count:])
+    with open(SHADOW_TRADES_JSON, "w") as f:
+        json.dump(_sanitize_for_json(existing), f, indent=2, default=str)
+    _shadow_last_trade_count = current
+    logger.info(f"SHADOW trade persisted ({SHADOW_MODEL_VERSION}): total={current}")
+
+
+def _shadow_snapshot() -> Optional[Dict]:
+    """Compact shadow-generator state for /status, /shadow/status and WS payloads."""
+    if shadow_signal_gen is None:
+        return None
+    g = shadow_signal_gen
+    wins = getattr(g, "wins", 0)
+    losses = getattr(g, "losses", 0)
+    closed = wins + losses
+    return {
+        "version": SHADOW_MODEL_VERSION,
+        "position": g.position,
+        "balance": getattr(g, "balance", None),
+        "total_pnl": getattr(g, "total_pnl", None),
+        "total_trades": len(g.trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": (wins / closed) if closed else 0.0,
+        "last_signal": _last_shadow_signal,
+    }
+
+
+def _check_and_persist_new_trades():
+    """Check if signal_gen has new trades and persist them."""
+    global _last_trade_count
+    if signal_gen is None:
+        return
+
+    current_count = len(signal_gen.trades)
+    if current_count > _last_trade_count:
+        # Persist new trades
+        for trade in signal_gen.trades[_last_trade_count:]:
+            _persist_trade(trade)
+            if kill_switch is not None:
+                kill_switch.record_pnl(float(trade.get("pnl_dollar", 0.0) or 0.0))
+        _last_trade_count = current_count
+
+
+# ── Broker-aware sizing and transition planning ───────────────────────────
+
+# Serializes auto-exec transitions. BTC and ETH klines both close on the same
+# minute boundary, and each closed candle runs the full handler — without this
+# lock the two ticks race and submit duplicate legs (same client_id, seconds
+# apart), one of which then rejects with -2022 or double-fills.
+_exec_lock = asyncio.Lock()
+
+# Testnet USDM filters snapshot (2026-07) — used only when the live
+# exchangeInfo fetch is unavailable (paper mode, network failure).
+_FALLBACK_FILTERS = {
+    "BTCUSDT": {"step_size": 0.0001, "min_qty": 0.0001, "min_notional": 50.0},
+    "ETHUSDT": {"step_size": 0.001, "min_qty": 0.001, "min_notional": 20.0},
+}
+
+_EXEC_SYMBOLS = ("BTCUSDT", "ETHUSDT")
+
+
+def _floor_step(qty: float, step: float) -> float:
+    """Floor a quantity to the exchange step size (never round up)."""
+    if step <= 0:
+        return qty
+    return round(math.floor(qty / step + 1e-9) * step, 8)
+
+
+def _symbol_filters(symbol: str) -> dict:
+    live = broker_client.get_symbol_filters(symbol) if broker_client else None
+    return live or _FALLBACK_FILTERS.get(symbol, {"step_size": 0.0, "min_qty": 0.0, "min_notional": 0.0})
+
+
+def _fixed_qty(symbol: str) -> float:
+    return broker_config.default_btc_qty if symbol == "BTCUSDT" else broker_config.default_eth_qty
+
+
+def _size_legs(prices: dict) -> dict:
+    """Compute the target entry quantity per symbol. Blocking (balance query) —
+    call via ``asyncio.to_thread``.
+
+    Sizing basis is the USDT *wallet balance* of the demo account, not
+    availableBalance: cross-margin inflates available with other assets'
+    collateral, so wallet balance is the conservative, stable equity figure.
+    target notional = equity × risk_fraction; qty = notional / candle close,
+    floored to the exchange step, clamped by the safety caps and the guard
+    max-notional. Below minQty/minNotional → the leg is not tradable ("skip").
+
+    Returns ``{symbol: {"qty", "skip", "sizing": {...}}}``. Falls back to the
+    configured fixed sizes whenever an equity figure cannot be resolved
+    (paper broker, balance query failure, sizing_mode="fixed") — trading never
+    silently stops because sizing data is missing.
+    """
+    basis, equity = "fixed", None
+    if broker_config.sizing_mode == "balance":
+        try:
+            bal = broker_client.get_balance()
+            usdt = next((a for a in bal.get("assets", []) if a.get("asset") == "USDT"), None)
+            wallet = float(usdt.get("balance", 0.0) or 0.0) if usdt else 0.0
+            if wallet > 0:
+                equity, basis = wallet, "balance"
+            else:
+                basis = "fixed-fallback"
+        except Exception as e:
+            logger.warning(f"Balance sizing unavailable ({e}); using fixed leg sizes")
+            basis = "fixed-fallback"
+
+    limits = _safety_limits()
+    out: dict = {}
+    for symbol in _EXEC_SYMBOLS:
+        price = float(prices.get(symbol) or 0.0)
+        filters = _symbol_filters(symbol)
+        raw = _fixed_qty(symbol)
+        clamped_by = None
+        if basis == "balance" and price > 0:
+            raw = (equity * broker_config.risk_fraction) / price
+        qty = raw
+        cap = limits["max_qty"].get(symbol, limits["default_max_qty"])
+        if qty > cap:
+            qty, clamped_by = cap, f"safety cap {cap}"
+        if execution_guards is not None and price > 0 and qty * price > execution_guards.max_notional_usdt:
+            qty = execution_guards.max_notional_usdt / price
+            clamped_by = f"max notional {execution_guards.max_notional_usdt:g} USDT"
+        qty = _floor_step(qty, filters["step_size"])
+        skip = None
+        if qty < filters["min_qty"]:
+            skip = f"below exchange min qty ({filters['min_qty']:g})"
+        elif price > 0 and qty * price < filters["min_notional"]:
+            skip = f"below exchange min notional ({filters['min_notional']:g} USDT)"
+        out[symbol] = {
+            "qty": qty,
+            "skip": skip,
+            "sizing": {
+                "basis": basis,
+                "equity": equity,
+                "risk_fraction": broker_config.risk_fraction if basis == "balance" else None,
+                "price": price or None,
+                "raw_qty": round(raw, 8),
+                "clamped_by": clamped_by,
+            },
+        }
+    return out
+
+
+def _target_exposure(pos: int, sized: dict) -> dict:
+    """Signed target exposure per symbol for a model position.
+    LONG ratio = long BTC + short ETH; SHORT ratio = the reverse."""
+    if pos == 0:
+        return {}
+    sign = 1 if pos > 0 else -1
+    return {
+        "BTCUSDT": sign * sized["BTCUSDT"]["qty"],
+        "ETHUSDT": -sign * sized["ETHUSDT"]["qty"],
+    }
+
+
+def _assumed_exposure(pos: int) -> dict:
+    """Exposure implied by the internally tracked position, at fixed sizes.
+    Used only when the exchange cannot be queried (paper mode / API failure)."""
+    if pos == 0:
+        return {}
+    sign = 1 if pos > 0 else -1
+    return {
+        "BTCUSDT": sign * broker_config.default_btc_qty,
+        "ETHUSDT": -sign * broker_config.default_eth_qty,
+    }
+
+
+def _skipped_leg(symbol: str, side: str, qty: float, kind: str, reason: str, sizing: Optional[dict] = None) -> dict:
+    """A leg the planner decided NOT to send. kind: "satisfied" (exchange
+    already at target) | "not-tradable" (below exchange thresholds) |
+    "drift" (position the model expected is not on the exchange)."""
+    leg = {
+        "symbol": symbol, "side": side, "qty": qty, "reduce_only": False,
+        "status": "SKIPPED", "order_id": "", "filled_qty": 0.0, "avg_price": 0.0,
+        "error": None, "skip_kind": kind, "skip_reason": reason,
+    }
+    if sizing:
+        leg["sizing"] = sizing
+    return leg
+
+
+async def _plan_transition(prev_pos: int, new_pos: int, sized: dict) -> dict:
+    """Plan only the legs actually required to move the *real* broker state to
+    the target exposure.
+
+    Queries live positions first: exits are sized to the actual exchange
+    position (never the configured default), a reduce-only order is never sent
+    for a symbol the exchange holds no position in, and entries are skipped
+    when the exchange already has same-side exposure (another writer, a
+    previous partial fill). When the exchange cannot be queried the planner
+    falls back to the internally tracked exposure — identical to the old
+    behavior, so paper mode is unchanged.
+    """
+    actual = None
+    if broker_client is not None:
+        actual = await asyncio.to_thread(broker_client.try_get_open_positions)
+    if actual is None:
+        current = _assumed_exposure(prev_pos)
+        source = "model-assumed"
+    else:
+        current = {}
+        for p in actual:
+            if p.get("symbol") in _EXEC_SYMBOLS:
+                signed = p.get("signed_size")
+                if signed is None:
+                    signed = p.get("size", 0.0) * (1 if p.get("side") == "LONG" else -1)
+                current[p["symbol"]] = float(signed)
+        source = "exchange"
+
+    target = _target_exposure(new_pos, sized)
+    exits: list = []
+    entries: list = []
+    skipped: list = []
+    for symbol in _EXEC_SYMBOLS:
+        cur = current.get(symbol, 0.0)
+        tgt = target.get(symbol, 0.0)
+        same_side = cur != 0 and tgt != 0 and (cur > 0) == (tgt > 0)
+        if cur != 0 and not same_side:
+            exits.append({
+                "symbol": symbol,
+                "side": "SELL" if cur > 0 else "BUY",
+                "qty": _floor_step(abs(cur), _symbol_filters(symbol)["step_size"]),
+                "reduce_only": True,
+                # Decision price = signal candle close; reconciliation measures
+                # exit slippage against it (entries carry it inside sizing).
+                "decision_price": sized[symbol]["sizing"].get("price"),
+            })
+        if tgt != 0:
+            side = "BUY" if tgt > 0 else "SELL"
+            if same_side:
+                # same-side exposure satisfies the target — no resize
+                # churn; sizes re-converge on the next full exit/entry cycle.
+                skipped.append(_skipped_leg(
+                    symbol, side, abs(tgt), "satisfied",
+                    f"already {'LONG' if cur > 0 else 'SHORT'} {abs(cur):g} {symbol} on exchange — target satisfied",
+                ))
+            elif sized[symbol]["skip"]:
+                skipped.append(_skipped_leg(
+                    symbol, side, 0.0, "not-tradable", sized[symbol]["skip"],
+                    sizing=sized[symbol]["sizing"],
+                ))
+            else:
+                entries.append({
+                    "symbol": symbol, "side": side, "qty": abs(tgt),
+                    "reduce_only": False, "sizing": sized[symbol]["sizing"],
+                    "decision_price": sized[symbol]["sizing"].get("price"),
+                })
+
+    # The model expected exposure that the exchange does not have (closed by
+    # another writer / manual close). That is drift to reconcile, not a
+    # broker failure — record it so operators can see it.
+    if source == "exchange" and prev_pos != 0:
+        expected = _assumed_exposure(prev_pos)
+        for symbol, exp in expected.items():
+            if current.get(symbol, 0.0) == 0.0:
+                skipped.append(_skipped_leg(
+                    symbol, "SELL" if exp > 0 else "BUY", 0.0, "drift",
+                    f"no {symbol} position on exchange to reduce — reconciled without an order",
+                ))
+
+    return {"exits": exits, "entries": entries, "skipped": skipped, "source": source}
+
+
+async def _place_leg_order(
+    symbol: str,
+    side: str,
+    qty: float,
+    reduce_only: bool,
+    tag: str,
+) -> dict:
+    """Place a single MARKET order for one leg of a ratio trade.
+
+    Returns a result dict with keys: symbol, side, qty, reduce_only, status,
+    order_id, filled_qty, avg_price, error.  Never raises.
+    """
+    client_id = f"v415-{tag}-{symbol[:3]}"[:36]
+    req = OrderRequest(
+        symbol=symbol,
+        side=side,
+        order_type="MARKET",
+        quantity=qty,
+        reduce_only=reduce_only,
+        client_id=client_id,
+    )
+    # client_id is persisted on the leg so reconciliation can trace any
+    # broker order back to the exact signal candle + intent that caused it.
+    base = {"symbol": symbol, "side": side, "qty": qty, "reduce_only": reduce_only, "client_id": client_id}
+    try:
+        resp = await asyncio.to_thread(broker_client.place_order, req)
+        if resp.status == "REJECTED":
+            logger.warning(
+                f"Broker leg REJECTED {symbol} {side} qty={qty} reduce={reduce_only}: {resp.message}"
+            )
+            return {**base, "status": "REJECTED", "order_id": "", "filled_qty": 0.0, "avg_price": 0.0, "error": resp.message}
+        logger.info(
+            f"Broker leg {symbol} {side} qty={qty} reduce={reduce_only} "
+            f"→ {resp.status} id={resp.broker_order_id} filled={resp.filled_qty} avg={resp.avg_price}"
+        )
+        return {**base, "status": resp.status, "order_id": resp.broker_order_id, "filled_qty": resp.filled_qty, "avg_price": resp.avg_price, "error": None}
+    except Exception as e:
+        logger.error(f"Broker leg {symbol} {side} raised: {e}", exc_info=True)
+        return {**base, "status": "ERROR", "order_id": "", "filled_qty": 0.0, "avg_price": 0.0, "error": str(e)}
+
+
+async def _place_planned_legs(specs: list, timestamp: int, label: str) -> list:
+    """Submit planner leg specs sequentially; carry sizing detail onto results."""
+    results = []
+    for spec in specs:
+        r = await _place_leg_order(
+            spec["symbol"], spec["side"], spec["qty"], spec["reduce_only"],
+            tag=f"{timestamp}-{label}",
+        )
+        if spec.get("sizing"):
+            r["sizing"] = spec["sizing"]
+        if spec.get("decision_price") is not None:
+            r["decision_price"] = spec["decision_price"]
+        results.append(r)
+    return results
+
+
+_TERMINAL_STATUSES = {"FILLED", "REJECTED", "ERROR", "CANCELED", "EXPIRED"}
+# Statuses that mean "the exchange never accepted this order" — no fill to unwind.
+_FAILED_STATUSES = frozenset({"REJECTED", "ERROR"})
+
+
+async def _unwind_one_leg(leg: dict) -> dict:
+    """Reverse a filled entry leg with a reduce-only MARKET order.
+
+    Used when a multi-leg entry partially fails: if leg A fills but leg B is
+    rejected, we send a reduce-only SELL/BUY on leg A's symbol to close the
+    unhedged position.  Reuses ``_place_leg_order`` so errors are caught and
+    returned as status="ERROR" rather than raised.
+    """
+    close_side = "SELL" if leg["side"] == "BUY" else "BUY"
+    tag = f"unwind-{(leg.get('order_id') or 'x')[:12]}"
+    result = await _place_leg_order(
+        leg["symbol"], close_side, leg["qty"], reduce_only=True, tag=tag
+    )
+    result["unwind"] = True  # mark so downstream readers can distinguish
+    return result
+
+
+# Outcomes that mean "nothing went wrong" — no true broker failure occurred.
+_BENIGN_OUTCOMES = frozenset({"OK", "RECONCILED", "SKIPPED"})
+
+
+def _build_exec_event(
+    prev_pos: int,
+    new_pos: int,
+    final_pos: int,
+    exit_legs: list,
+    entry_legs: list,
+    unwind_legs: list,
+    outcome: str,
+    skipped_legs: Optional[list] = None,
+    exposure_source: Optional[str] = None,
+    signal_ts: Optional[int] = None,
+) -> dict:
+    """Build the execution event dict stored in ``_last_execution_event``.
+
+    ``outcome`` is one of: "OK" | "RECONCILED" | "SKIPPED"
+      | "EXIT_PARTIAL_FAILURE" | "ENTRY_ALL_REJECTED"
+      | "ENTRY_PARTIAL_UNWIND_OK" | "ENTRY_PARTIAL_UNWIND_FAILED".
+    "RECONCILED": the exchange already matched the target (or the expected
+    position was gone) — state advanced without sending any order.
+    "SKIPPED": the intended entry was not tradable (below exchange minimums).
+
+    The flat ``legs`` list (exit + entry + unwind + skipped) is kept for
+    backward compatibility with ``_reconcile_legs`` and WS consumers.
+    """
+    _pl = {-1: "SHORT", 0: "FLAT", 1: "LONG"}
+    skipped_legs = skipped_legs or []
+    all_legs = exit_legs + entry_legs + unwind_legs + skipped_legs
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        # Signal candle time (epoch s) — the reconciliation join key back to
+        # the model ledger's entry_time/exit_time. None on legacy rows.
+        "signal_ts": signal_ts,
+        "prev_pos": prev_pos,
+        "new_pos": new_pos,
+        "final_pos": final_pos,
+        "transition": f"{_pl.get(prev_pos, '?')}→{_pl.get(new_pos, '?')}",
+        "outcome": outcome,
+        "all_ok": outcome in _BENIGN_OUTCOMES,
+        "legs": all_legs,
+        "exit_legs": exit_legs,
+        "entry_legs": entry_legs,
+        "unwind_legs": unwind_legs,
+        "skipped_legs": skipped_legs,
+        "exposure_source": exposure_source,
+        "reconciled": False,
+    }
+
+
+async def _reconcile_legs(legs: list) -> None:
+    """Poll Binance concurrently for confirmed fill data on all submitted legs.
+
+    Each leg is polled independently with back-off: 0.5 s, 1.5 s, 3.5 s cumulative.
+    Legs without an order_id or already in a terminal state are skipped.
+    Paper broker returns None from get_order_status and is also skipped.
+    Total worst-case wall time ≈ 3.5 s regardless of how many legs there are.
+    """
+    POLL_DELAYS = [0.5, 1.0, 2.0]  # gaps between polls; cumulative max ≈ 3.5 s
+
+    async def _poll_one(leg: dict) -> None:
+        order_id = leg.get("order_id", "")
+        if not order_id or leg.get("status") in _TERMINAL_STATUSES:
+            return
+        for delay in POLL_DELAYS:
+            await asyncio.sleep(delay)
+            try:
+                fill = await asyncio.to_thread(
+                    broker_client.get_order_status, leg["symbol"], order_id
+                )
+            except Exception as e:
+                logger.warning(f"Reconcile poll error {leg['symbol']} #{order_id}: {e}")
+                return
+            if fill is None:
+                return  # paper broker — no polling possible
+            leg["status"] = fill["status"]
+            leg["filled_qty"] = fill["filled_qty"]
+            leg["avg_price"] = fill["avg_price"]
+            leg["reconciled"] = True
+            if fill["status"] in _TERMINAL_STATUSES:
+                logger.info(
+                    f"Reconciled {leg['symbol']} #{order_id}: "
+                    f"{fill['status']} qty={fill['filled_qty']} avg={fill['avg_price']:.2f}"
+                )
+                return
+
+    await asyncio.gather(*(_poll_one(leg) for leg in legs))
+
+
+async def _reconcile_and_broadcast() -> None:
+    """Background task: reconcile leg fills then push an exec_reconciled WS event."""
+    global _last_execution_event
+    if _last_execution_event is None:
+        return
+    legs = _last_execution_event.get("legs", [])
+    await _reconcile_legs(legs)
+    # all_ok reflects the outcome determined at execution time; reconciliation
+    # only updates fill details, it does not override a partial-failure outcome.
+    _last_execution_event["all_ok"] = _last_execution_event.get("outcome") in _BENIGN_OUTCOMES
+    _last_execution_event["reconciled"] = True
+    _persist_exec_event(_last_execution_event)
+    # Broadcast a lightweight message so the frontend doesn't wait for the next candle
+    await broadcast_to_clients({
+        "type": "exec_reconciled",
+        "last_exec": _last_execution_event,
+    })
+    logger.info(
+        "Reconciliation broadcast: %d legs, outcome=%s, all_ok=%s",
+        len(legs),
+        _last_execution_event.get("outcome"),
+        _last_execution_event["all_ok"],
+    )
+
+
+async def _recon_sync_loop() -> None:
+    """Periodic read-only broker history ingest for reconciliation.
+
+    Pulls userTrades + FUNDING_FEE income into the local cache every
+    RECON_SYNC_SECONDS. Paper mode returns unsupported and the loop just
+    idles cheaply. Never raises; a failed sync surfaces as sync.age_s
+    growing in /reconciliation/summary.
+    """
+    while True:
+        try:
+            if broker_client is not None and broker_client.mode == "demo":
+                await asyncio.to_thread(_recon_store.sync, broker_client)
+        except Exception as e:
+            logger.warning(f"recon sync loop error: {e}")
+        await asyncio.sleep(reconciliation.RECON_SYNC_SECONDS)
+
+
+def _load_all_exec_events() -> list:
+    """Full exec-event history, one row per event (reconciled snapshot wins)."""
+    rows = _read_jsonl_tail(EXEC_EVENTS_JSONL, 2000)
+    latest: Dict[str, dict] = {}
+    for row in rows:  # oldest→newest; reconciled rows overwrite submit rows
+        ts = str(row.get("timestamp", ""))
+        if ts:
+            latest[ts] = row
+    return sorted(latest.values(), key=lambda r: r.get("timestamp", ""))
+
+
+def _exchange_net_position() -> Optional[int]:
+    """Infer the ratio position implied by live exchange exposure.
+    1 = long BTC/short ETH, -1 = the reverse, 0 = flat, None = unknown/mixed."""
+    if broker_client is None:
+        return None
+    actual = broker_client.try_get_open_positions()
+    if actual is None:
+        return None
+    net = {s: 0.0 for s in _EXEC_SYMBOLS}
+    for p in actual:
+        if p.get("symbol") in net:
+            signed = p.get("signed_size")
+            if signed is None:
+                signed = p.get("size", 0.0) * (1 if p.get("side") == "LONG" else -1)
+            net[p["symbol"]] = float(signed)
+    btc, eth = net["BTCUSDT"], net["ETHUSDT"]
+    if btc == 0 and eth == 0:
+        return 0
+    if btc > 0 and eth < 0:
+        return 1
+    if btc < 0 and eth > 0:
+        return -1
+    return None  # mixed / one-legged — reported as drift by the caller
+
+
+async def _position_check() -> Dict:
+    """Primary reconciliation invariant: model vs broker-tracked vs exchange."""
+    model_pos = signal_gen.position if signal_gen is not None else None
+    exchange_pos = None
+    if broker_client is not None and broker_client.mode == "demo":
+        exchange_pos = await asyncio.to_thread(_exchange_net_position)
+    known = [p for p in (model_pos, _broker_position, exchange_pos) if p is not None]
+    status = "OK"
+    if len(set(known)) > 1:
+        status = "DRIFT"
+    elif exchange_pos is None and broker_client is not None and broker_client.mode == "demo":
+        status = "UNKNOWN"
+    return {
+        "model_pos": model_pos,
+        "broker_pos": _broker_position,
+        "exchange_pos": exchange_pos,
+        "status": status,
+    }
+
+
+async def _run_reconciliation() -> Dict:
+    """Load all inputs and run the pure engine (see api/reconciliation.py)."""
+    trades: list = []
+    if TRADE_HISTORY_JSON.exists():
+        try:
+            with open(TRADE_HISTORY_JSON, "r") as f:
+                trades = json.load(f)
+        except Exception:
+            trades = []
+    events = _load_all_exec_events()
+    fills, funding = _recon_store.load()
+    manual_ids = reconciliation.manual_order_ids_from_activity(JSONL_LOG_PATH)
+    eligibility = reconciliation.load_eligibility(execution_control.AUDIT_PATH)
+    pos_check = await _position_check()
+    return reconciliation.reconcile(
+        trades, events, fills, funding,
+        eligibility=eligibility,
+        manual_order_ids=manual_ids,
+        sync_age_s=_recon_store.last_sync_age_s(),
+        position_check=pos_check,
+    )
+
+
+def _auto_exec_eligible() -> bool:
+    """Whether the per-candle auto-exec block runs at all.
+
+    True for BOTH demo (real testnet orders) and paper (simulated fills):
+    the guard/kill-switch/leg/event chain must behave identically in both, so
+    paper is a faithful rehearsal and the model never holds a position with no
+    execution trace. (The incident this fixes: paper mode used to skip the
+    block silently while the UI said "auto-execute ON".)
+    """
+    if not (
+        broker_client is not None
+        and broker_config is not None
+        and broker_client.mode in ("demo", "paper")
+        and broker_config.auto_execute
+    ):
+        return False
+    # Demo mode places real testnet orders — only the designated writer
+    # instance may do that. Paper is simulated fills (no broker), so the
+    # rehearsal path stays available on any instance.
+    if broker_client.mode == "demo" and not execution_control.is_writer():
+        global _non_writer_warned
+        if not _non_writer_warned:
+            logger.warning(
+                "AUTO-EXEC BLOCKED: this instance (%s) is not the execution "
+                "writer — auto_execute is on but demo orders are refused. "
+                "Set EXECUTION_WRITER=1 only on the canonical instance.",
+                execution_control.instance_id(),
+            )
+            _non_writer_warned = True
+        return False
+    return True
+
+
+_non_writer_warned = False
+
+
+async def _maybe_auto_execute(target_pos: int, timestamp: int, prices: dict) -> bool:
+    """Serialize transition execution across candle ticks.
+
+    BTC and ETH candles close on the same minute boundary and each closed
+    candle runs the full handler; only one may execute a transition. A tick
+    that arrives mid-execution is skipped (not queued) — the next candle
+    re-checks drift and retries if still needed. Drift is re-checked under
+    the lock so a tick queued behind a completed execution never re-fires.
+    Returns True if an execution actually ran.
+    """
+    if _exec_lock.locked():
+        logger.info(
+            "AUTO-EXEC SKIPPED [in-flight]: %d→%d — execution already running",
+            _broker_position, target_pos,
+        )
+        return False
+    async with _exec_lock:
+        if target_pos == _broker_position:
+            return False
+        await _execute_broker_position_change(_broker_position, target_pos, timestamp, prices)
+        return True
+
+
+async def _execute_broker_position_change(
+    prev_pos: int, new_pos: int, timestamp: int, prices: Optional[dict] = None
+) -> None:
+    """Execute broker orders for a model position transition with leg-sync safety.
+
+    Staged flow:
+      Step 0 — Size the target legs (balance-based unless configured fixed)
+               and plan the transition against *actual* broker positions:
+               exits only for real exchange exposure (at its real size),
+               entries only where the exchange is not already positioned.
+      Step 1 — Submit planned exit legs.
+               If any exit leg is rejected/errored, abort immediately and keep
+               _broker_position = prev_pos so the next signal tick retries.
+      Step 2 — Submit planned entry legs (if any).
+               If ALL entry legs fail:  stay flat (final_pos = 0).
+               If SOME entry legs fill and SOME fail (partial entry):
+                 fire reduce-only MARKET orders to unwind the filled leg(s),
+                 then stay flat (final_pos = 0).
+               If ALL entry legs succeed: advance to new_pos.
+      No orders needed — exchange already matches the target (drift healed or
+      another writer got there first): advance state, outcome "RECONCILED".
+      Entry not tradable (below exchange minimums): outcome "SKIPPED".
+
+    ``_broker_position`` is only advanced to new_pos when the exchange
+    verifiably matches it. In failure cases it is left at a consistent
+    known-safe value so the next tick re-attempts the right transition.
+    """
+    global _broker_position, _last_execution_event
+
+    _pl = {-1: "SHORT", 0: "FLAT", 1: "LONG"}
+    entry_legs: list = []
+    unwind_legs: list = []
+    final_pos = prev_pos  # conservative default — only advanced on confirmed success
+
+    # ── Step 0: Size and plan against real broker state ─────────────────────
+    sized = await asyncio.to_thread(_size_legs, prices or {})
+    plan = await _plan_transition(prev_pos, new_pos, sized)
+    skipped_legs = plan["skipped"]
+
+    # ── Step 1: Submit planned exit legs ─────────────────────────────────────
+    exit_legs: list = []
+    if plan["exits"]:
+        label = "XL" if prev_pos == 1 else "XS" if prev_pos == -1 else "X"
+        exit_legs = await _place_planned_legs(plan["exits"], timestamp, label)
+        exit_failures = [l for l in exit_legs if l["status"] in _FAILED_STATUSES]
+
+        if exit_failures:
+            # At least one exit leg was rejected.  The old position may be
+            # partially or fully open on the exchange.  Keep _broker_position
+            # at prev_pos — the next signal tick will retry the exit cleanly.
+            logger.error(
+                "EXIT PARTIAL FAILURE [%s→%s]: %d/%d leg(s) failed (%s); "
+                "keeping _broker_position=%d to allow retry on next signal",
+                _pl.get(prev_pos, "?"), _pl.get(new_pos, "?"),
+                len(exit_failures), len(exit_legs),
+                ", ".join(f"{l['symbol']} {l['status']}" for l in exit_failures),
+                prev_pos,
+            )
+            _broker_position = prev_pos
+            _last_execution_event = _build_exec_event(
+                prev_pos, new_pos, prev_pos, exit_legs, [], [], "EXIT_PARTIAL_FAILURE",
+                skipped_legs, plan["source"], signal_ts=timestamp,
+            )
+            _persist_exec_event(_last_execution_event)
+            await broadcast_to_clients({"type": "exec_event", "last_exec": _last_execution_event})
+            asyncio.create_task(_reconcile_and_broadcast())
+            return
+
+    # All exit legs accepted (or none were needed) — previous exposure is gone
+    final_pos = 0
+
+    # ── Step 2: Submit planned entry legs ─────────────────────────────────────
+    if plan["entries"]:
+        label = "L" if new_pos == 1 else "S"
+        entry_legs = await _place_planned_legs(plan["entries"], timestamp, label)
+        entry_failures = [l for l in entry_legs if l["status"] in _FAILED_STATUSES]
+        entry_filled   = [l for l in entry_legs if l["status"] not in _FAILED_STATUSES]
+
+        if entry_failures and entry_filled:
+            # Partial entry: some legs went through, some were rejected.
+            # Unwind the filled legs in parallel to avoid an unhedged position.
+            logger.error(
+                "ENTRY PARTIAL FAILURE [%s→%s]: %d/%d leg(s) failed; "
+                "unwinding %d filled leg(s) to stay flat",
+                _pl.get(prev_pos, "?"), _pl.get(new_pos, "?"),
+                len(entry_failures), len(entry_legs), len(entry_filled),
+            )
+            unwind_legs = list(await asyncio.gather(
+                *(_unwind_one_leg(l) for l in entry_filled)
+            ))
+            unwind_failures = [l for l in unwind_legs if l["status"] in _FAILED_STATUSES]
+            if unwind_failures:
+                logger.critical(
+                    "UNWIND FAILED for %d leg(s) — manual broker intervention required: %s",
+                    len(unwind_failures),
+                    ", ".join(f"{l['symbol']} {l['side']}" for l in unwind_failures),
+                )
+                outcome = "ENTRY_PARTIAL_UNWIND_FAILED"
+            else:
+                logger.info(
+                    "Unwind succeeded for %d leg(s) — position stays flat",
+                    len(unwind_legs),
+                )
+                outcome = "ENTRY_PARTIAL_UNWIND_OK"
+            final_pos = 0  # stay flat regardless; unwind log shows what needs attention
+
+        elif entry_failures:
+            # All entry legs rejected — no fill occurred, stay flat cleanly
+            logger.error(
+                "ENTRY ALL REJECTED [%s→%s]: staying FLAT",
+                _pl.get(prev_pos, "?"), _pl.get(new_pos, "?"),
+            )
+            outcome = "ENTRY_ALL_REJECTED"
+            final_pos = 0
+
+        else:
+            # All entry legs accepted
+            outcome = "OK"
+            final_pos = new_pos
+
+    else:
+        # No entry orders were needed.
+        not_tradable = [l for l in skipped_legs if l.get("skip_kind") == "not-tradable"]
+        if new_pos != 0 and not_tradable:
+            # The intended entry is below exchange minimums — nothing was sent.
+            # Stay flat; the model will re-attempt when sizing becomes tradable.
+            outcome = "SKIPPED"
+            final_pos = 0
+            logger.warning(
+                "ENTRY SKIPPED [%s→%s]: %s",
+                _pl.get(prev_pos, "?"), _pl.get(new_pos, "?"),
+                "; ".join(l["skip_reason"] for l in not_tradable),
+            )
+        elif new_pos != 0:
+            # Target exposure already on the exchange (another writer / earlier
+            # partial) — nothing to send, state converges without orders.
+            outcome = "RECONCILED"
+            final_pos = new_pos
+        elif not exit_legs and prev_pos != 0:
+            # Model expected a position; exchange is already flat — drift healed.
+            outcome = "RECONCILED"
+            final_pos = 0
+        else:
+            # Exit-only (new_pos == 0) with all exits succeeding
+            outcome = "OK"
+            final_pos = 0
+
+    _broker_position = final_pos
+    _last_execution_event = _build_exec_event(
+        prev_pos, new_pos, final_pos, exit_legs, entry_legs, unwind_legs, outcome,
+        skipped_legs, plan["source"], signal_ts=timestamp,
+    )
+    _persist_exec_event(_last_execution_event)
+    logger.info(
+        "AUTO-EXEC [%s] %s→%s confirmed→%s (%d exit / %d entry / %d unwind / %d skipped legs): %s",
+        outcome,
+        _pl.get(prev_pos, "?"), _pl.get(new_pos, "?"), _pl.get(final_pos, "?"),
+        len(exit_legs), len(entry_legs), len(unwind_legs), len(skipped_legs),
+        ", ".join(
+            f"{l['symbol']} {l['side']} {l['status']}"
+            for l in exit_legs + entry_legs + unwind_legs + skipped_legs
+        ),
+    )
+    # Background reconciliation enriches fill details then re-broadcasts
+    asyncio.create_task(_reconcile_and_broadcast())
+
+
+# ── REST warm-up ─────────────────────────────────────────────────────────
+
+def fetch_historical_candles(symbol: str, interval: str = "1m", limit: int = 1000) -> list:
+    """Fetch historical klines from REST API."""
+    url = f"{REST_BASE}/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    logger.info(f"Fetching {limit} {interval} candles for {symbol}...")
+
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    candles = []
+    for k in data:
+        candles.append({
+            "time": int(k[0]) // 1000,
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5]),
+            "taker_buy_volume": float(k[9]),
+        })
+
+    logger.info(f"  Got {len(candles)} candles for {symbol}")
+    return candles
+
+
+# ── WebSocket data loop ──────────────────────────────────────────────────
+
+async def connect_to_data_stream():
+    """Connect to WebSocket and stream BTC/ETH 1m klines."""
+    streams = ["btcusdt@kline_1m", "ethusdt@kline_1m"]
+    url = f"{WS_STREAM_BASE}?streams={'/'.join(streams)}"
+
+    logger.info(f"Connecting to data WebSocket: {url}")
+
+    while True:
+        try:
+            async with websockets.connect(url) as ws:
+                logger.info("Connected to data WebSocket — streaming live data")
+
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                        await process_kline_message(data)
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}", exc_info=True)
+
+        except Exception as e:
+            logger.error(f"Data WebSocket error: {e}")
+            logger.info("Reconnecting in 5 seconds...")
+            await asyncio.sleep(5)
+
+
+async def process_kline_message(data: Dict):
+    """Process incoming kline message."""
+    if "data" not in data:
+        return
+
+    stream_data = data["data"]
+    if stream_data.get("e") != "kline":
+        return
+
+    kline = stream_data["k"]
+    symbol_raw = stream_data["s"]
+
+    if symbol_raw == "BTCUSDT":
+        symbol = "BTC"
+    elif symbol_raw == "ETHUSDT":
+        symbol = "ETH"
+    else:
+        return
+
+    candle = {
+        "time": int(kline["t"]) // 1000,
+        "open": float(kline["o"]),
+        "high": float(kline["h"]),
+        "low": float(kline["l"]),
+        "close": float(kline["c"]),
+        "volume": float(kline["v"]),
+        "taker_buy_volume": float(kline.get("V", float(kline["v"]) * 0.5)),
+    }
+
+    is_closed = kline.get("x", False)
+    feature_calc.add_candle(symbol, candle)
+
+    # Only run full prediction on CLOSED candles to avoid lookahead
+    if not is_closed:
+        return
+
+    data_quality = feature_calc.get_data_quality_status()
+    if not data_quality["ready"]:
+        return
+
+    # Calculate features
+    t0 = time.time()
+    features_df = feature_calc.calculate_features()
+    calc_ms = (time.time() - t0) * 1000
+
+    if features_df is None:
+        logger.warning("Feature calc returned None (NaN values)")
+        return
+
+    # Run prediction
+    proba = model.predict_proba(features_df)[:, 1]
+    proba_up = float(proba[0])
+
+    # Current ratio
+    btc_close = feature_calc.btc_candles[-1]["close"]
+    eth_close = feature_calc.eth_candles[-1]["close"]
+    current_ratio = btc_close / eth_close
+
+    # Capture pre-update model position for change detection
+    _pre_update_pos = signal_gen.position
+
+    # Generate signal
+    sig = signal_gen.update(proba_up, current_ratio, candle["time"])
+
+    # Persist new trades to disk
+    _check_and_persist_new_trades()
+
+    # Shadow candidate: same ratio/timestamp, isolated state, own file,
+    # no broker interaction. Runs AFTER the primary path so a shadow bug can
+    # never affect the live signal. A shadow with its own weights (dual-model
+    # slot) predicts on the SAME feature vector; otherwise it shares proba_up.
+    if shadow_signal_gen is not None:
+        global _last_shadow_signal
+        try:
+            shadow_proba = proba_up
+            if shadow_model is not None:
+                shadow_proba = float(shadow_model.predict_proba(features_df)[:, 1][0])
+            shadow_sig = shadow_signal_gen.update(shadow_proba, current_ratio, candle["time"])
+            _last_shadow_signal = {
+                "direction": shadow_sig["direction"],
+                "triggered": shadow_sig["triggered"],
+                "probability": shadow_sig["probability"],
+                "own_model": shadow_model is not None,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            _check_and_persist_shadow_trades()
+            if shadow_signal_gen.position != signal_gen.position:
+                logger.info(
+                    "SHADOW DIVERGENCE | primary(%s)=%d shadow(%s)=%d proba=%.4f",
+                    MODEL_VERSION, signal_gen.position,
+                    SHADOW_MODEL_VERSION, shadow_signal_gen.position, proba_up,
+                )
+        except Exception as e:
+            logger.error(f"Shadow generator error (primary unaffected): {e}", exc_info=True)
+
+    # Structured decision log — emitted every time a signal fires
+    if sig["triggered"]:
+        logger.info(
+            "DECISION | direction=%s probability=%.4f strength=%.4f "
+            "broker_pos=%d signal_pos=%d auto_execute=%s mode=%s",
+            sig["direction"],
+            proba_up,
+            sig.get("strength", 0),
+            _broker_position,
+            signal_gen.position,
+            broker_config.auto_execute if broker_config else False,
+            broker_client.mode if broker_client else "none",
+        )
+
+    # Auto-execute: send dual-leg broker orders whenever model and broker
+    # positions differ. Runs every candle (not just on transitions), so drift
+    # from a restart mid-position / late auto-exec enable / broker recovery
+    # self-heals on the next candle instead of persisting silently.
+    if _auto_exec_eligible():
+        _post_update_pos = signal_gen.position
+        if _post_update_pos != _broker_position:
+            blocked = False
+            # Kill switch: tripped blocks new entries; exits to flat always proceed
+            if _post_update_pos != 0 and kill_switch is not None and not kill_switch.entries_allowed:
+                blocked = True
+                logger.warning(
+                    "AUTO-EXEC BLOCKED [kill_switch_tripped]: %d\u2192%d \u2014 position unchanged",
+                    _broker_position, _post_update_pos,
+                )
+            # Exits to flat always proceed; entries/reversals go through guards
+            if not blocked and _post_update_pos != 0 and execution_guards is not None:
+                guard = execution_guards.check_entry(
+                    confidence=proba_up,
+                    candle_ts=candle["time"],
+                    leg_price=btc_close,
+                    leg_qty=broker_config.default_btc_qty,
+                    # ratio strategy holds at most 1 position; reversals
+                    # replace the old position so open_position_count stays 0.
+                    open_position_count=0,
+                )
+                blocked = not guard.allowed
+                if blocked:
+                    logger.warning(
+                        "AUTO-EXEC BLOCKED [%s]: %d→%d — position unchanged",
+                        guard.reason, _broker_position, _post_update_pos,
+                    )
+            if not blocked:
+                await _maybe_auto_execute(
+                    _post_update_pos, candle["time"],
+                    prices={"BTCUSDT": btc_close, "ETHUSDT": eth_close},
+                )
+    # Build ALL features for frontend display & export (all 50)
+    feature_values = {}
+    for col in feature_names:
+        feature_values[col] = float(features_df[col].iloc[0])
+
+    # Prepare message
+    message = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "ratio": current_ratio,
+        "btc_price": btc_close,
+        "eth_price": eth_close,
+        "features": feature_values,
+        "signal": {
+            "direction": sig["direction"],
+            "strength": sig["strength"],
+            "probability": sig["probability"],
+            "triggered": sig["triggered"],
+            "blocked_by": sig["blocked_by"],
+            "reasoning": sig["reasoning"],
+            "circuit_breaker_active": sig["circuit_breaker_active"],
+            "entry_threshold": signal_gen.entry_threshold,
+            "exit_threshold": signal_gen.exit_threshold,
+        },
+        "position_meta": sig["position_meta"],
+        "portfolio": sig["portfolio"],
+        "data_quality": data_quality,
+        "model_info": {
+            "version": MODEL_VERSION,
+            "configured_version": CONFIGURED_MODEL_VERSION,
+            "stale_after_s": STALE_AFTER_SECONDS,
+            "n_features": len(feature_names),
+            "calc_time_ms": round(calc_ms, 1),
+            "broker": _broker_summary(),
+            "last_exec": _last_execution_event,
+            "shadow": _shadow_snapshot(),
+            "research_timing": _research_timing_light(),
+        },
+    }
+
+    # Sanitize numpy types so json.dumps never fails
+    message = _sanitize_for_json(message)
+
+    # Update global state
+    global latest_signal_data
+    latest_signal_data = message
+
+    # Broadcast to connected frontend clients
+    await broadcast_to_clients(message)
+
+    # Log significant events
+    if sig["triggered"]:
+        logger.info(
+            f"SIGNAL TRIGGERED: {sig['direction']} | "
+            f"P(up)={proba_up:.4f} | R={current_ratio:.4f}"
+        )
+
+
+async def broadcast_to_clients(message: Dict):
+    """Broadcast message to all connected WebSocket clients."""
+    if not active_connections:
+        return
+
+    connections = active_connections.copy()
+    for conn in connections:
+        try:
+            await conn.send_json(message)
+        except Exception:
+            active_connections.discard(conn)
+
+
+# ── Startup / Shutdown ─────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load model, warm up feature calculator, start data WS."""
+    global model, feature_names, config, feature_calc, signal_gen, _last_trade_count
+
+    version = MODEL_VERSION
+    logger.info("=" * 80)
+    logger.info(f"{version.upper()} MODEL SERVER - STARTING")
+    logger.info("=" * 80)
+
+    # 1. Load model (shared across all versions)
+    logger.info(f"Loading {version} production model...")
+    assert MODEL_PATH.exists(), f"Model not found: {MODEL_PATH}"
+
+    model = XGBClassifier()
+    model.load_model(str(MODEL_PATH))
+
+    with open(FEATURE_NAMES_PATH) as f:
+        feature_names = json.load(f)
+
+    with open(CONFIG_PATH) as f:
+        config = json.load(f)
+
+    logger.info(f"  Model: {len(feature_names)} features, {config['best_n_estimators']} trees")
+
+    # 2. Initialize components — version-aware signal generator
+    feature_calc = V414FeatureCalculator(
+        feature_names=feature_names,
+        max_history=1500,
+    )
+
+    signal_gen = _make_signal_gen(version)
+    logger.info(f"  Signal generator: {type(signal_gen).__name__} ({version})")
+
+    # Shadow candidate generator — isolated instance, own persistence file.
+    # A strategy-lab registration (run-in-shadow) survives restarts and takes
+    # precedence over the SHADOW_MODEL_VERSION env; with no registration file
+    # the env behaves exactly as before.
+    shadow_version = SHADOW_MODEL_VERSION
+    reg = strategy_lab.read_shadow_registration()
+    if reg:
+        try:
+            register_version(reg["version"], strategy_lab.registration_config(reg))
+            shadow_version = reg["version"]
+            logger.info(f"  Shadow registration restored: {reg['version']} ({reg.get('label')})")
+        except Exception as e:
+            logger.warning(f"  Shadow registration restore failed: {e}")
+    if shadow_version:
+        _activate_shadow(shadow_version)
+
+    # Ensure trade persistence directory exists
+    _ensure_live_dir()
+
+    # Restore portfolio state from persisted trade history so balance
+    # survives server restarts instead of resetting to $1000.
+    if TRADE_HISTORY_JSON.exists():
+        try:
+            with open(TRADE_HISTORY_JSON, "r") as f:
+                persisted_trades = json.load(f)
+            if persisted_trades:
+                signal_gen.restore_from_trades(persisted_trades)
+                _last_trade_count = len(persisted_trades)
+                logger.info(f"  Restored {len(persisted_trades)} trades from disk")
+            else:
+                _last_trade_count = 0
+        except Exception as e:
+            logger.warning(f"  Could not restore trade history: {e}")
+            _last_trade_count = 0
+    else:
+        _last_trade_count = 0
+
+    logger.info(f"  Trade history: {TRADE_HISTORY_JSON}")
+
+    # 2.5. Broker integration — runtime config + (Binance Testnet | paper) client
+    global broker_client, broker_config, _broker_position, execution_guards, kill_switch
+    broker_config = load_broker_config()
+    broker_client = make_broker_client()
+    # signal_gen.position is always 0 after restore_from_trades; safe sentinel.
+    _broker_position = 0
+    logger.info(
+        f"  Broker: mode={broker_client.mode} "
+        f"auto_execute={broker_config.auto_execute} "
+        f"symbol={broker_config.default_symbol} "
+        f"qty={broker_config.default_qty} "
+        f"btc_qty={broker_config.default_btc_qty} "
+        f"eth_qty={broker_config.default_eth_qty}"
+    )
+
+    # 2.6. Execution guardrails (configured from env vars)
+    execution_guards = ExecutionGuards()
+    logger.info(f"  Execution guards: {execution_guards.to_dict()}")
+
+    # 2.7. Session max-loss kill switch (state survives restarts)
+    kill_switch = KillSwitch.load(KILL_SWITCH_JSON)
+    logger.info(f"  Kill switch: {kill_switch.to_dict()}")
+
+    if broker_client.mode == "demo":
+        logger.info("=" * 80)
+        logger.info("PAPER TRADING DEMO MODE — Binance Testnet, no real funds at risk")
+        logger.info("=" * 80)
+    else:
+        logger.info("SIMULATED PAPER MODE — all orders synthetic, no broker connection")
+
+    # 3. Warm up with historical candles
+    logger.info(f"Warming up with {WARMUP_CANDLES} historical candles...")
+    try:
+        btc_candles = fetch_historical_candles("BTCUSDT", "1m", WARMUP_CANDLES)
+        eth_candles = fetch_historical_candles("ETHUSDT", "1m", WARMUP_CANDLES)
+        feature_calc.seed_historical("BTC", btc_candles)
+        feature_calc.seed_historical("ETH", eth_candles)
+
+        status = feature_calc.get_data_quality_status()
+        logger.info(f"  BTC: {status['btc_candles']} candles | ETH: {status['eth_candles']} candles")
+        logger.info(f"  Ready: {status['ready']}")
+
+        # Verify features work
+        test_features = feature_calc.calculate_features()
+        if test_features is not None:
+            test_proba = model.predict_proba(test_features)[:, 1]
+            logger.info(f"  Initial P(up) = {float(test_proba[0]):.4f}")
+        else:
+            logger.warning("  Initial feature calc returned None — will retry with live data")
+
+    except Exception as e:
+        logger.error(f"Warm-up failed: {e}. Server will attempt warm-up from live data.")
+
+    # 4. Start data WebSocket task
+    data_task = asyncio.create_task(connect_to_data_stream())
+
+    # 5. Strategy-lab research scheduler (RESEARCH_AUTO=0 disables). Getters
+    # read module globals at call time so promotions are picked up.
+    research_task = asyncio.create_task(strategy_lab.scheduler_loop(
+        lambda: (model, feature_names), lambda: MODEL_VERSION))
+
+    # 6. Reconciliation sync loop — read-only broker history ingest (demo
+    # only; the paper broker has no exchange history behind it).
+    recon_task = asyncio.create_task(_recon_sync_loop())
+
+    # 7. Microstructure ingestion — read-only PUBLIC market data (L2 + tape),
+    # keyless, no broker path (MICROSTRUCTURE.md). Off unless enabled().
+    micro_started = False
+    if microstructure_ingest.enabled():
+        microstructure_ingest.start_microstructure_ingestion()
+        micro_started = True
+    logger.info("=" * 80)
+    logger.info(f"{version.upper()} MODEL SERVER - READY")
+    logger.info("=" * 80)
+
+    yield
+
+    # Shutdown
+    logger.info("Shutting down model server...")
+    for task in (data_task, research_task, recon_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    if micro_started:
+        await microstructure_ingest.stop_microstructure_ingestion()
+
+
+# ── Auth helpers ────────────────────────────────────────────────────────────
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    """Verify password against bcrypt hash."""
+    if not hashed:
+        return False
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def _create_jwt(username: str) -> str:
+    """Create JWT token for authenticated user."""
+    expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS)
+    return jwt.encode(
+        {"sub": username, "exp": expire},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+
+
+def _verify_jwt(token: str) -> Optional[str]:
+    """Verify JWT and return username, or None if invalid."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+
+def _get_token_from_request(authorization: Optional[str] = None) -> Optional[str]:
+    """Extract Bearer token from Authorization header."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    return authorization[7:].strip()
+
+
+def _require_auth_or_skip(authorization: Optional[str] = None):
+    """If AUTH_REQUIRED, validate JWT. Otherwise allow."""
+    if not AUTH_REQUIRED:
+        return
+    token = _get_token_from_request(authorization)
+    if not token or not _verify_jwt(token):
+        raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
+def _verify_api_key(api_key: Optional[str] = None, x_api_key: Optional[str] = None):
+    """Verify subscriber API key for /api/predict."""
+    key = api_key or x_api_key
+    if not SUBSCRIBER_API_KEY or key != SUBSCRIBER_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+# ── Broker helpers ─────────────────────────────────────────────────────────
+
+
+def _research_timing_light() -> Optional[Dict]:
+    """Tiny advisory flag for the WS payload (cached ≤5 min): the frontend
+    toasts on the rising edge. Advisory only — nothing auto-starts."""
+    try:
+        full = timing_advisor.advise_cached(
+            last_success=strategy_lab.load_state().get("last_success"),
+            next_scheduled=strategy_lab.scheduler_snapshot(),
+        )
+        now = full["now"]
+        return {
+            "recommended": now["recommended"],
+            "reason": now["reasons"][0] if now["reasons"] else None,
+            "confidence": now["confidence"],
+        }
+    except Exception:  # the advisor must never take the live loop down
+        return None
+
+
+def _broker_summary() -> Dict:
+    """Compact broker snapshot exposed in /status and WS payloads."""
+    return {
+        "mode": broker_client.mode if broker_client is not None else "unknown",
+        # Why the demo broker fell back to paper (e.g. expired testnet keys);
+        # None when the broker is running as configured.
+        "init_error": getattr(broker_client, "init_error", None),
+        "auto_execute": broker_config.auto_execute if broker_config is not None else False,
+        "default_symbol": broker_config.default_symbol if broker_config is not None else "BTCUSDT",
+        "default_qty": broker_config.default_qty if broker_config is not None else 0.001,
+        "default_btc_qty": broker_config.default_btc_qty if broker_config is not None else 0.001,
+        "default_eth_qty": broker_config.default_eth_qty if broker_config is not None else 0.05,
+        "sizing_mode": broker_config.sizing_mode if broker_config is not None else "fixed",
+        "risk_fraction": broker_config.risk_fraction if broker_config is not None else None,
+        # Which instance is allowed to place broker orders (see EXECUTION_CONTROL.md)
+        "writer": execution_control.writer_info(),
+        "guards": execution_guards.to_dict() if execution_guards is not None else None,
+        "kill_switch": kill_switch.to_dict() if kill_switch is not None else None,
+        # Model vs broker position (-1/0/+1). Drift means the broker was never
+        # told about the model's current position (entry happened while
+        # auto-exec was off / broker unavailable / before a restart). With
+        # auto-exec on it self-heals on the next candle; surfaced so the
+        # operator sees it rather than trusting silence.
+        "position_drift": {
+            "model": signal_gen.position if signal_gen is not None else 0,
+            "broker": _broker_position,
+            "drifted": (signal_gen.position if signal_gen is not None else 0) != _broker_position,
+        },
+    }
+
+
+def _freshness() -> Dict:
+    """Data-freshness contract for /status and clients.
+
+    Truth = age of the last fully-processed candle (the older leg of the
+    BTC/ETH pair — a fresh BTC candle can't compensate for a dead ETH feed).
+    `stale` is explicit so no client has to invent its own threshold.
+    """
+    dq = feature_calc.get_data_quality_status() if feature_calc else None
+    last_candle = None
+    if dq:
+        times = [t for t in (dq.get("last_btc_time"), dq.get("last_eth_time")) if t]
+        last_candle = min(times) if times else None
+    age = (datetime.now(timezone.utc).timestamp() - last_candle) if last_candle else None
+    return {
+        "last_candle_ts": last_candle,
+        "age_seconds": round(age, 1) if age is not None else None,
+        "stale_after_seconds": STALE_AFTER_SECONDS,
+        # No candle yet counts as stale — absence of data is never "fresh"
+        "stale": bool(age is None or age > STALE_AFTER_SECONDS),
+    }
+
+
+# ── FastAPI app ────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title=f"{MODEL_VERSION} Trading Model Server",
+    description="Real-time BTC/ETH ratio trading signals via XGBClassifier",
+    version=MODEL_VERSION,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://app.pairpredictions.com",
+        "https://pairpredictions.com",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app|http://localhost:\d+|http://127\.0\.0\.1:\d+",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.get("/")
+async def root():
+    return {
+        "status": "running",
+        "service": f"{MODEL_VERSION} Trading Model Server",
+        "version": MODEL_VERSION,
+        "model": "XGBClassifier",
+    }
+
+
+@app.post("/api/login")
+async def api_login(req: LoginRequest):
+    """Authenticate user and return JWT."""
+    if not AUTH_REQUIRED:
+        return {"token": _create_jwt(ADMIN_USERNAME), "user": ADMIN_USERNAME}
+    if not ADMIN_PASSWORD_HASH:
+        raise HTTPException(status_code=503, detail="Auth not configured")
+    if req.username != ADMIN_USERNAME or not _verify_password(req.password, ADMIN_PASSWORD_HASH):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return {"token": _create_jwt(req.username), "user": req.username}
+
+
+@app.get("/api/me")
+async def api_me(authorization: Optional[str] = Header(None)):
+    """Validate JWT and return user info."""
+    if not AUTH_REQUIRED:
+        return {"user": ADMIN_USERNAME, "authenticated": True}
+    token = _get_token_from_request(authorization)
+    username = _verify_jwt(token) if token else None
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid or missing token")
+    return {"user": username, "authenticated": True}
+
+
+@app.post("/api/logout")
+async def api_logout():
+    """Logout (client should discard token)."""
+    return {"status": "ok"}
+
+
+@app.get("/api/predict")
+async def api_predict(
+    request: Request,
+    api_key: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+):
+    """Return latest prediction. Auth: X-API-Key header or ?api_key= query param."""
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        key = auth_header[7:].strip()
+    else:
+        key = api_key or x_api_key
+    _verify_api_key(api_key=key, x_api_key=key)
+    if not latest_signal_data.get("timestamp"):
+        raise HTTPException(status_code=503, detail="No prediction available yet")
+    return _sanitize_for_json(latest_signal_data)
+
+
+@app.get("/version")
+async def version():
+    """Return current model version and available versions."""
+    return {
+        "current": MODEL_VERSION,
+        "configured": CONFIGURED_MODEL_VERSION,
+        "available": list_versions(),
+    }
+
+
+class PromoteRequest(BaseModel):
+    version: str
+    confirm: bool = False
+
+
+@app.post("/model/promote")
+async def promote_model(req: PromoteRequest, authorization: Optional[str] = Header(None)):
+    """Promote the shadow candidate to live. Deliberate and explicit by design:
+
+    - only the currently-evaluated shadow candidate can be promoted (a version
+      nobody has watched running never goes live by API call),
+    - requires confirm=true,
+    - refuses while any position is open or model/broker are drifted,
+    - carries the live portfolio (balance, pnl, trade history) across the swap,
+    - runtime-only: the env (Railway MODEL_VERSION) must be updated to persist.
+
+    Broker routing is untouched — auto_execute, guards and the kill switch
+    govern execution exactly as before.
+    """
+    _require_auth_or_skip(authorization)
+    global MODEL_VERSION, SHADOW_MODEL_VERSION, signal_gen, shadow_signal_gen
+
+    if shadow_signal_gen is None:
+        raise HTTPException(status_code=400, detail="No shadow candidate configured — nothing to promote")
+    if req.version != SHADOW_MODEL_VERSION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only the evaluated shadow candidate ({SHADOW_MODEL_VERSION}) can be promoted",
+        )
+    if not req.confirm:
+        raise HTTPException(status_code=400, detail="Promotion changes the live strategy — resend with confirm=true")
+    if signal_gen.position != 0 or shadow_signal_gen.position != 0:
+        raise HTTPException(status_code=409, detail="Refusing to promote while a position is open — wait for flat")
+    drift = _broker_summary().get("position_drift") or {}
+    if drift.get("drifted"):
+        raise HTTPException(status_code=409, detail="Refusing to promote while model/broker positions are drifted — reconcile first")
+
+    old_version = MODEL_VERSION
+    new_gen = _make_signal_gen(req.version)
+    # Portfolio continuity: the account outlives the strategy swap
+    for attr in ("balance", "starting_balance", "total_pnl", "wins", "losses", "trades"):
+        if hasattr(signal_gen, attr) and hasattr(new_gen, attr):
+            setattr(new_gen, attr, getattr(signal_gen, attr))
+    signal_gen = new_gen
+    MODEL_VERSION = req.version
+    # The candidate is live now — the shadow slot retires (its trades file
+    # stays on disk as the evaluation record).
+    _deactivate_shadow()
+
+    # Strategy-lab bookkeeping: a promoted lab candidate leaves the shadow
+    # registration behind and its lifecycle becomes PROMOTED (best-effort).
+    reg = strategy_lab.read_shadow_registration()
+    if reg and reg.get("version") == req.version:
+        strategy_lab.clear_shadow_registration(reason="promoted to live")
+        strategy_lab.set_lifecycle(reg["candidate_id"], "PROMOTED", reason="promoted to live")
+
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "from": old_version,
+        "to": req.version,
+        "configured_env": CONFIGURED_MODEL_VERSION,
+    }
+    _ensure_live_dir()
+    with open(PROMOTIONS_JSONL, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+    note = (
+        f"Runtime promotion only — set MODEL_VERSION={req.version} and unset/rotate "
+        f"SHADOW_MODEL_VERSION in the deployment env (Railway) to persist across restarts."
+    )
+    logger.warning(f"MODEL PROMOTED {old_version} → {req.version} (runtime). {note}")
+    return {"ok": True, "from": old_version, "to": req.version, "persisted": False, "note": note}
+
+
+@app.get("/status")
+async def status():
+    return {
+        "data_quality": feature_calc.get_data_quality_status() if feature_calc else None,
+        "latest_signal": latest_signal_data.get("signal"),
+        "last_update": latest_signal_data.get("timestamp"),
+        "freshness": _freshness(),
+        "active_clients": len(active_connections),
+        "model_version": MODEL_VERSION,
+        "configured_version": CONFIGURED_MODEL_VERSION,
+        "n_features": len(feature_names),
+        "broker": _broker_summary(),
+        "last_exec": _last_execution_event,
+        "shadow": _shadow_snapshot(),
+        "microstructure": microstructure_ingest.status_snapshot(),
+    }
+
+
+@app.get("/shadow/status")
+async def shadow_status(authorization: Optional[str] = Header(None)):
+    """Shadow candidate vs primary comparison. enabled=false when no shadow is configured."""
+    _require_auth_or_skip(authorization)
+    if shadow_signal_gen is None:
+        return {"enabled": False, "primary_version": MODEL_VERSION}
+
+    shadow_trades = []
+    if SHADOW_TRADES_JSON and SHADOW_TRADES_JSON.exists():
+        try:
+            with open(SHADOW_TRADES_JSON, "r") as f:
+                shadow_trades = json.load(f)
+        except Exception:
+            shadow_trades = []
+
+    def _side(gen, trades):
+        wins = getattr(gen, "wins", 0)
+        losses = getattr(gen, "losses", 0)
+        closed = wins + losses
+        return {
+            "position": gen.position,
+            "balance": getattr(gen, "balance", None),
+            "total_pnl": getattr(gen, "total_pnl", None),
+            "total_trades": len(trades),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / closed) if closed else 0.0,
+            "recent_trades": trades[-20:],
+            "stats": compute_trade_stats(trades, getattr(gen, "starting_balance", 1000.0)),
+            # Broker-realistic lens: the same stats engine over net-of-cost
+            # trades (taker fee model) — the comparison that actually decides
+            # promotion. Gross stats stay for continuity; net is the truth.
+            "stats_net": compute_trade_stats(_net_view(trades), getattr(gen, "starting_balance", 1000.0)),
+            # Degradation lens: same engine over only the last 20 closed trades,
+            # so recent form can be compared against lifetime honestly (n is
+            # reported; small-sample metrics stay suppressed).
+            "recent_stats": compute_trade_stats(trades[-20:], getattr(gen, "starting_balance", 1000.0)),
+        }
+
+    primary_trades = []
+    if TRADE_HISTORY_JSON.exists():
+        try:
+            with open(TRADE_HISTORY_JSON, "r") as f:
+                primary_trades = json.load(f)
+        except Exception:
+            primary_trades = []
+
+    # Matched comparison window: lifetime baseline stats aren't comparable to a
+    # candidate that only started observing recently, so the primary side also
+    # gets stats restricted to the shadow's observation window (earliest shadow
+    # trade, or this server boot when the shadow hasn't traded yet).
+    window_since = _SERVER_STARTED_TS
+    if shadow_trades:
+        first_shadow = min((t.get("entry_time") or window_since) for t in shadow_trades)
+        window_since = min(window_since, first_shadow)
+    primary_in_window = [t for t in primary_trades if (t.get("exit_time") or 0) >= window_since]
+
+    primary_side = _side(signal_gen, primary_trades)
+    primary_side["window_stats"] = compute_trade_stats(
+        primary_in_window, getattr(signal_gen, "starting_balance", 1000.0)
+    )
+
+    shadow_side = _side(shadow_signal_gen, shadow_trades)
+
+    # Strategy-lab context: which candidate occupies the slot (None for a
+    # plain env-configured shadow) + continuous promotion-readiness signal.
+    reg = strategy_lab.read_shadow_registration()
+    candidate = None
+    readiness_since = window_since
+    if reg and reg.get("version") == SHADOW_MODEL_VERSION:
+        candidate = {
+            "candidate_id": reg["candidate_id"],
+            "label": reg.get("label"),
+            "registered_ts": reg.get("registered_ts"),
+        }
+        try:
+            readiness_since = datetime.fromisoformat(reg["registered_ts"]).timestamp()
+        except Exception:
+            pass
+    readiness = strategy_lab.promotion_readiness(
+        readiness_since, shadow_side["stats"], primary_side["window_stats"])
+
+    return _sanitize_for_json({
+        "enabled": True,
+        "primary_version": MODEL_VERSION,
+        "shadow_version": SHADOW_MODEL_VERSION,
+        "window_since": window_since,
+        "primary": primary_side,
+        "shadow": shadow_side,
+        "last_shadow_signal": _last_shadow_signal,
+        "candidate": candidate,
+        "readiness": readiness,
+        # Runtime identity of the comparison: the shadow slot never writes to
+        # the broker, and a dual-model candidate runs its own weights.
+        "runtime_mode": "shadow-only — no broker writes",
+        "shadow_own_model": shadow_model is not None,
+        "cost_model": {
+            "fee_bps_per_side": SHADOW_FEE_BPS_PER_SIDE,
+            "fills_per_round_trip": 4,
+            "round_trip_pct": round(_SHADOW_RT_COST * 100, 4),
+        },
+    })
+
+
+# ── Strategy lab: research → deploy-candidate → shadow ─────────────────────
+# Design record: STRATEGY_LAB.md. Research jobs replay disciplined config
+# families over cached model probabilities (walk-forward folds + reserved
+# holdout, fee-aware) and gate deploy-candidates explicitly. The shadow slot
+# stays evaluation-only — broker orders come from the primary path alone.
+
+
+@app.get("/research/status")
+async def research_status(authorization: Optional[str] = Header(None)):
+    """Scheduler + current job + last-run leaderboard summary."""
+    _require_auth_or_skip(authorization)
+    store = strategy_lab.load_candidates()
+    summary = None
+    if store:
+        counts: Dict[str, int] = {}
+        for c in store["candidates"]:
+            counts[c["lifecycle"]] = counts.get(c["lifecycle"], 0) + 1
+        summary = {
+            "run_id": store.get("run_id"),
+            "generated": store.get("generated"),
+            "trigger": store.get("trigger"),
+            "depth": store.get("depth"),
+            "trials": store.get("trials"),
+            "sr_benchmark": store.get("sr_benchmark"),
+            "baseline_version": store.get("baseline_version"),
+            "counts": counts,
+            "top": [
+                {"id": c["id"], "label": c["label"], "score": c["score"],
+                 "lifecycle": c["lifecycle"], "rank": c["rank"]}
+                for c in store["candidates"][:5]
+            ],
+        }
+    return {
+        "job": strategy_lab.job_snapshot(),
+        "scheduler": strategy_lab.scheduler_snapshot(),
+        "summary": summary,
+    }
+
+
+class ResearchRunRequest(BaseModel):
+    depth: str = "deep"
+    pairs: Optional[List[str]] = None  # subset of strategy_lab.PAIR_UNIVERSE
+
+
+@app.post("/research/run")
+async def research_run(req: ResearchRunRequest,
+                       authorization: Optional[str] = Header(None)):
+    """Start a research job. 409 while one is running (single-job guard)."""
+    _require_auth_or_skip(authorization)
+    try:
+        job = strategy_lab.start_research_job(
+            trigger="operator", depth=req.depth, pairs=req.pairs,
+            model=model, feature_names=feature_names, live_version=MODEL_VERSION)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "job": job}
+
+
+@app.get("/research/multi-symbol")
+async def research_multi_symbol(authorization: Optional[str] = Header(None)):
+    """Per-pair verdict counts + strategy × pair matrix for the latest run."""
+    _require_auth_or_skip(authorization)
+    data = strategy_lab.load_multi_symbol()
+    if not data:
+        return {"available": False}
+    return {"available": True, "universe": sorted(strategy_lab.PAIR_UNIVERSE), **data}
+
+
+@app.get("/research/candidates")
+async def research_candidates(authorization: Optional[str] = Header(None)):
+    """Full ranked candidate store: gates, folds, fee sensitivity, lifecycle."""
+    _require_auth_or_skip(authorization)
+    store = strategy_lab.load_candidates()
+    if not store:
+        return {"available": False}
+    return {"available": True, **store}
+
+
+class ShadowRegisterRequest(BaseModel):
+    confirm: bool = False
+
+
+@app.post("/research/candidates/{cand_id}/shadow")
+async def research_register_shadow(cand_id: str, req: ShadowRegisterRequest,
+                                   authorization: Optional[str] = Header(None)):
+    """Run a deploy-candidate in shadow: register its config as a runtime
+    version and swap it into the existing (evaluation-only) shadow slot."""
+    _require_auth_or_skip(authorization)
+    cand = strategy_lab.get_candidate(cand_id)
+    if cand is None:
+        raise HTTPException(status_code=404, detail=f"Unknown candidate '{cand_id}' — run research first")
+    if cand.get("role") != "candidate":
+        raise HTTPException(status_code=400, detail="Baseline versions use SHADOW_MODEL_VERSION, not lab registration")
+    if cand.get("lifecycle") not in ("DEPLOY_CANDIDATE", "SHADOW_REJECTED", "SHADOW_RUNNING"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only deploy-candidates enter shadow (lifecycle: {cand.get('lifecycle')}). "
+                   "The gates exist so 'deploy-candidate' means something.")
+    if cand.get("pair") not in (None, strategy_lab.DEFAULT_PAIR):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Candidate was evaluated on {cand['pair']} — the live stream trades "
+                   f"{strategy_lab.DEFAULT_PAIR}, so only default-pair candidates can run in "
+                   "shadow. Cross-pair results are robustness evidence, not deployables.")
+    if not req.confirm:
+        raise HTTPException(status_code=400, detail="Shadow registration replaces the current candidate slot — resend with confirm=true")
+
+    version = strategy_lab.shadow_version_name(cand_id)
+    register_version(version, strategy_lab.spec_config(cand))
+
+    # A displaced lab candidate goes back to DEPLOY_CANDIDATE (it was not
+    # rejected — it just lost the single evaluation slot).
+    prev = strategy_lab.read_shadow_registration()
+    if prev and prev.get("candidate_id") not in (None, cand_id):
+        strategy_lab.set_lifecycle(prev["candidate_id"], "DEPLOY_CANDIDATE",
+                                   reason=f"displaced from shadow by {cand_id}")
+
+    reg = strategy_lab.write_shadow_registration(cand, trigger="operator")
+    _activate_shadow(version)
+    strategy_lab.set_lifecycle(cand_id, "SHADOW_RUNNING", reason="operator run-in-shadow")
+    logger.warning(f"SHADOW candidate registered: {cand_id} ({cand['label']}) as {version}")
+    return {
+        "ok": True,
+        "version": version,
+        "registration": reg,
+        "note": "Evaluation-only: the shadow slot computes signals and paper "
+                "trades on the live stream — broker orders come from the "
+                "primary path alone.",
+    }
+
+
+class ShadowStopRequest(BaseModel):
+    confirm: bool = False
+
+
+@app.post("/research/shadow/stop")
+async def research_stop_shadow(req: ShadowStopRequest,
+                               authorization: Optional[str] = Header(None)):
+    """End a lab candidate's shadow evaluation with a SHADOW_REJECTED verdict."""
+    _require_auth_or_skip(authorization)
+    reg = strategy_lab.read_shadow_registration()
+    if not reg:
+        raise HTTPException(status_code=404, detail="No lab candidate is registered in shadow")
+    if not req.confirm:
+        raise HTTPException(status_code=400, detail="Stopping ends the evaluation (verdict: SHADOW_REJECTED) — resend with confirm=true")
+    strategy_lab.clear_shadow_registration(reason="operator stop")
+    strategy_lab.set_lifecycle(reg["candidate_id"], "SHADOW_REJECTED",
+                               reason="operator stopped shadow evaluation")
+    _deactivate_shadow()
+    return {"ok": True, "candidate": reg["candidate_id"], "verdict": "SHADOW_REJECTED"}
+
+
+# ── Operator tools: audit readers, timing advisor, simulation ───────────────
+# Read-only investigation + advisory + decision-support surfaces
+# (RESEARCH_TOOLS.md). None of these can reach the broker or the control
+# plane's write path.
+
+
+@app.get("/execution/audit")
+async def get_execution_audit(
+    limit: int = Query(50, ge=1, le=200),
+    cursor: Optional[str] = None,
+    actor: Optional[str] = None,
+    via: Optional[str] = None,
+    outcome: Optional[str] = None,
+    event: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """Control-plane audit trail, filtered + paginated (newest first). Same
+    auth as the control endpoints — who can change execution control can read
+    its audit."""
+    _require_auth_or_skip(authorization)
+    return ops_audit.read_audit(execution_control.AUDIT_PATH, limit=limit,
+                                cursor=cursor, actor=actor, via=via,
+                                outcome=outcome, event=event, since=since, until=until)
+
+
+@app.get("/execution/audit/summary")
+async def get_execution_audit_summary(authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    return ops_audit.audit_summary(execution_control.AUDIT_PATH)
+
+
+@app.get("/research/audit")
+async def get_research_audit(
+    limit: int = Query(50, ge=1, le=200),
+    cursor: Optional[str] = None,
+    event: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """Strategy-lab / simulation audit trail (runs, lifecycles, shadow events)."""
+    _require_auth_or_skip(authorization)
+    return ops_audit.read_audit(strategy_lab.AUDIT_JSONL, limit=limit,
+                                cursor=cursor, event=event, since=since, until=until)
+
+
+@app.get("/research/timing")
+async def get_research_timing(authorization: Optional[str] = Header(None)):
+    """Timing advisor: recommended research windows + why. Advisory only."""
+    _require_auth_or_skip(authorization)
+    return timing_advisor.advise(
+        last_success=strategy_lab.load_state().get("last_success"),
+        next_scheduled=strategy_lab.scheduler_snapshot(),
+    )
+
+
+class SimulationCampaignRequest(BaseModel):
+    strategy_ids: List[str]
+    label: Optional[str] = None
+    pairs: Optional[List[str]] = None
+    window_days: int = simulation_lab.DEFAULT_WINDOW_DAYS
+    fees: Optional[List[float]] = None
+
+
+@app.post("/simulation/campaign")
+async def create_simulation_campaign(
+    req: SimulationCampaignRequest,
+    authorization: Optional[str] = Header(None),
+    x_control_surface: Optional[str] = Header(None),
+):
+    """Create + start a simulation campaign. Pure replay — no broker writes,
+    no lifecycle changes. 409 while any heavy replay job runs."""
+    _require_auth_or_skip(authorization)
+    try:
+        meta = simulation_lab.create_campaign(
+            strategy_ids=req.strategy_ids, label=req.label, pairs=req.pairs,
+            window_days=req.window_days, fees=req.fees,
+            created_by=_control_actor(authorization),
+            created_via=(x_control_surface or "api").strip().lower()[:32] or "api",
+            model=model, feature_names=feature_names)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "campaign": meta}
+
+
+@app.get("/simulation/campaigns")
+async def list_simulation_campaigns(authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    return {"campaigns": simulation_lab.load_campaigns(),
+            "job": simulation_lab.job_snapshot()}
+
+
+@app.get("/simulation/status")
+async def simulation_status(id: str, authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    meta = simulation_lab.get_campaign(id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail=f"Unknown campaign '{id}'")
+    job = simulation_lab.job_snapshot()
+    return {"campaign": meta, "job": job if job.get("id") == id else None}
+
+
+@app.get("/simulation/results")
+async def simulation_results(id: str, authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    meta = simulation_lab.get_campaign(id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail=f"Unknown campaign '{id}'")
+    results = simulation_lab.load_results(id)
+    if results is None:
+        return {"available": False, "campaign": meta}
+    return {"available": True, "campaign": meta, **results}
+
+
+@app.get("/trades")
+async def get_trades(authorization: Optional[str] = Header(None)):
+    """Return persisted trade history from JSON file."""
+    _require_auth_or_skip(authorization)
+    if TRADE_HISTORY_JSON.exists():
+        try:
+            with open(TRADE_HISTORY_JSON, "r") as f:
+                trades = json.load(f)
+            return {"trades": trades, "count": len(trades)}
+        except Exception:
+            return {"trades": [], "count": 0}
+    return {"trades": [], "count": 0}
+
+
+@app.delete("/trades/clear")
+async def clear_trades(authorization: Optional[str] = Header(None)):
+    """Clear all persisted trade history and reset signal generator state."""
+    _require_auth_or_skip(authorization)
+    global _last_trade_count, latest_signal_data
+
+    # Clear JSON file
+    _ensure_live_dir()
+    with open(TRADE_HISTORY_JSON, "w") as f:
+        json.dump([], f)
+
+    # Clear CSV file
+    if TRADE_HISTORY_CSV.exists():
+        TRADE_HISTORY_CSV.unlink()
+
+    # Reset signal generator in-memory state
+    if signal_gen is not None:
+        signal_gen.trades = []
+        signal_gen.balance = signal_gen.starting_balance
+        signal_gen.total_pnl = 0.0
+        signal_gen.wins = 0
+        signal_gen.losses = 0
+    _last_trade_count = 0
+
+    # Purge stale trades from the cached WebSocket broadcast so
+    # reconnecting clients don't receive old portfolio data.
+    if latest_signal_data.get("portfolio"):
+        latest_signal_data["portfolio"]["recent_trades"] = []
+        latest_signal_data["portfolio"]["total_trades"] = 0
+        latest_signal_data["portfolio"]["wins"] = 0
+        latest_signal_data["portfolio"]["losses"] = 0
+        latest_signal_data["portfolio"]["win_rate"] = 0
+        latest_signal_data["portfolio"]["total_pnl"] = 0.0
+        latest_signal_data["portfolio"]["total_pnl_pct"] = 0.0
+        latest_signal_data["portfolio"]["balance"] = signal_gen.starting_balance if signal_gen else 1000.0
+
+    logger.info("Trade history cleared (JSON + CSV + in-memory state + cached broadcast)")
+    return {"status": "cleared"}
+
+
+@app.get("/features/importance")
+async def features_importance(authorization: Optional[str] = Header(None)):
+    """Return all 50 feature names with their XGBoost importance scores."""
+    _require_auth_or_skip(authorization)
+    if model is None or not feature_names:
+        return {"features": [], "error": "Model not loaded"}
+
+    try:
+        # Get feature importance from the model (gain-based)
+        importance_map = model.get_booster().get_score(importance_type="gain")
+
+        # The booster uses f0, f1, ... naming - map back to feature names
+        result = []
+        for idx, name in enumerate(feature_names):
+            # XGBoost feature key format
+            key = f"f{idx}"
+            score = importance_map.get(key, 0.0)
+            result.append({
+                "rank": 0,  # will be set after sorting
+                "name": name,
+                "importance": float(score),
+            })
+
+        # Sort by importance descending and assign ranks
+        result.sort(key=lambda x: x["importance"], reverse=True)
+        for i, item in enumerate(result):
+            item["rank"] = i + 1
+
+        return {"features": result, "count": len(result)}
+    except Exception as e:
+        logger.error(f"Error getting feature importance: {e}", exc_info=True)
+        return {"features": [], "error": str(e)}
+
+
+# ── Execution control plane ───────────────────────────────────────────────
+# Backend-authoritative shared auto-execute state. Explicit SET semantics,
+# integer-version optimistic concurrency, append-only audit. Both frontends
+# and the legacy /broker/config path route through _set_auto_execute so no
+# write can bypass versioning or audit. See EXECUTION_CONTROL.md.
+
+
+class ExecutionControlPatch(BaseModel):
+    auto_execute: bool
+    expected_version: Optional[int] = None
+    request_id: Optional[str] = None
+
+
+def _control_actor(authorization: Optional[str]) -> str:
+    token = _get_token_from_request(authorization)
+    username = _verify_jwt(token) if token else None
+    return username or "anonymous"
+
+
+def _execution_control_state() -> Dict:
+    return execution_control.control_state(
+        auto_execute=broker_config.auto_execute if broker_config is not None else False,
+        mode=broker_client.mode if broker_client is not None else "unknown",
+    )
+
+
+def _set_auto_execute(
+    desired: bool,
+    actor: str,
+    via: str,
+    expected_version: Optional[int] = None,
+    request_id: Optional[str] = None,
+) -> Dict:
+    """The single mutation path for auto_execute.
+
+    Idempotent (same value → no-op, no version bump) and conflict-checked
+    (stale expected_version → 409 with the authoritative state embedded).
+    Returns the fresh control state.
+    """
+    global broker_config
+    if broker_config is None:
+        raise HTTPException(status_code=503, detail="Broker config not initialized")
+    with execution_control.LOCK:
+        meta = execution_control.load_meta()
+        if expected_version is not None and expected_version != meta["version"]:
+            execution_control.audit_conflict(
+                expected_version, meta["version"], desired, actor, via, request_id
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "stale version — state changed elsewhere",
+                    "current": _execution_control_state(),
+                },
+            )
+        prev = broker_config.auto_execute
+        if desired == prev:
+            return _execution_control_state()  # idempotent no-op
+        new_cfg = apply_partial_update(broker_config, {"auto_execute": desired})
+        save_broker_config(new_cfg)
+        broker_config = new_cfg
+        execution_control.commit_change(prev, desired, actor, via, request_id)
+        return _execution_control_state()
+
+
+@app.get("/execution/control")
+async def get_execution_control(authorization: Optional[str] = Header(None)):
+    """Authoritative shared auto-execute state + writer identity."""
+    _require_auth_or_skip(authorization)
+    return _execution_control_state()
+
+
+@app.patch("/execution/control")
+async def patch_execution_control(
+    patch: ExecutionControlPatch,
+    authorization: Optional[str] = Header(None),
+    x_control_surface: Optional[str] = Header(None),
+):
+    """Explicit SET of the shared auto-execute state (never a toggle)."""
+    _require_auth_or_skip(authorization)
+    via = (x_control_surface or "api").strip().lower()[:32] or "api"
+    return _set_auto_execute(
+        desired=patch.auto_execute,
+        actor=_control_actor(authorization),
+        via=via,
+        expected_version=patch.expected_version,
+        request_id=patch.request_id,
+    )
+
+
+# ── Broker control ────────────────────────────────────────────────────────
+
+
+class BrokerConfigUpdate(BaseModel):
+    """Partial update payload for POST /broker/config."""
+
+    auto_execute: Optional[bool] = None
+    sizing_mode: Optional[str] = None
+    risk_fraction: Optional[float] = None
+    default_symbol: Optional[str] = None
+    default_qty: Optional[float] = None
+    default_btc_qty: Optional[float] = None
+    default_eth_qty: Optional[float] = None
+
+
+def _broker_or_503() -> BrokerClient:
+    if broker_client is None:
+        raise HTTPException(status_code=503, detail="Broker not initialized")
+    return broker_client
+
+
+@app.get("/broker/config")
+async def get_broker_config(authorization: Optional[str] = Header(None)):
+    """Return the current runtime broker config + mode."""
+    _require_auth_or_skip(authorization)
+    return _broker_summary()
+
+
+@app.post("/broker/config")
+async def update_broker_config_route(
+    update: BrokerConfigUpdate,
+    authorization: Optional[str] = Header(None),
+):
+    """Update auto_execute / default_symbol / default_qty at runtime."""
+    _require_auth_or_skip(authorization)
+    global broker_config
+    if broker_config is None:
+        raise HTTPException(status_code=503, detail="Broker config not initialized")
+
+    partial = update.model_dump(exclude_none=True)
+    # auto_execute is the shared operational control — route it through the
+    # control plane so legacy writes stay versioned and audited.
+    auto_execute = partial.pop("auto_execute", None)
+    if auto_execute is not None:
+        _set_auto_execute(auto_execute, actor=_control_actor(authorization), via="legacy-api")
+
+    if partial:
+        try:
+            new_cfg = apply_partial_update(broker_config, partial)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid broker config: {e}")
+        save_broker_config(new_cfg)
+        broker_config = new_cfg
+        logger.info(f"Broker config updated: {new_cfg.model_dump()}")
+    return _broker_summary()
+
+
+@app.get("/broker/balance")
+async def get_broker_balance(authorization: Optional[str] = Header(None)):
+    """Account balances. Additive fields: ``ok`` and ``error`` expose a broker
+    error envelope (e.g. expired testnet keys) instead of an ambiguous empty
+    list. Existing keys (``mode``, ``assets``, ``raw``) are unchanged."""
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    balance = await asyncio.to_thread(bc.get_balance)
+    raw = balance.get("raw")
+    error = None
+    if isinstance(raw, dict) and isinstance(raw.get("code"), int) and raw["code"] < 0:
+        error = f"{raw.get('code')}: {raw.get('msg', 'unknown broker error')}"
+    init_error = getattr(bc, "init_error", None)
+    if error is None and init_error:
+        error = f"broker degraded to paper: {init_error}"
+    return {"mode": bc.mode, "ok": error is None, "error": error, **balance}
+
+
+# Broker-log actions that constitute order activity (polling reads like
+# get_balance/get_order_status are logged too but are noise for operators).
+_ACTIVITY_ACTIONS = {
+    "place_order",
+    "place_test_order",
+    "cancel_order",
+    "bracket_stop_market",
+    "bracket_take_profit_market",
+}
+
+
+@app.get("/broker/executions")
+async def get_broker_executions(
+    limit: int = Query(50, ge=1, le=200),
+    authorization: Optional[str] = Header(None),
+):
+    """Auto-execute event history (persisted across restarts).
+
+    Each event appears once, newest first, with its most recent snapshot
+    (reconciled fills win over the submit-time row).
+    """
+    _require_auth_or_skip(authorization)
+    rows = _read_jsonl_tail(EXEC_EVENTS_JSONL, limit)
+    latest_by_ts: Dict[str, dict] = {}
+    for row in rows:  # oldest→newest, so later (reconciled) rows overwrite
+        ts = str(row.get("timestamp", ""))
+        if ts:
+            latest_by_ts[ts] = row
+    events = sorted(latest_by_ts.values(), key=lambda r: r.get("timestamp", ""), reverse=True)
+    events = events[:limit]
+    return {"executions": events, "count": len(events)}
+
+
+@app.get("/broker/activity")
+async def get_broker_activity(
+    limit: int = Query(50, ge=1, le=200),
+    authorization: Optional[str] = Header(None),
+):
+    """Order-level broker interactions (orders, brackets, cancels), newest
+    first, from the append-only broker log. Secrets are redacted at write
+    time. Read-only view — nothing here mutates broker or history state."""
+    _require_auth_or_skip(authorization)
+    rows = _read_jsonl_tail(JSONL_LOG_PATH, limit * 4)  # log includes non-activity rows
+    activity = [r for r in rows if r.get("action") in _ACTIVITY_ACTIONS]
+    activity.reverse()  # newest first
+    activity = activity[:limit]
+    return {"activity": activity, "count": len(activity)}
+
+
+@app.get("/broker/positions")
+async def get_broker_positions(authorization: Optional[str] = Header(None)):
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    positions = await asyncio.to_thread(bc.get_open_positions)
+    return {"mode": bc.mode, "positions": positions}
+
+
+# ── Reconciliation (TRADE_RECONCILIATION.md) — all read-only ──────────────
+
+@app.get("/broker/history")
+async def get_broker_history(
+    limit: int = Query(100, ge=1, le=1000),
+    symbol: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Normalized broker fills (userTrades cache), newest first, plus funding.
+
+    This is the broker's own account of what executed — the realized-truth
+    side of reconciliation. Populated by the background sync in demo mode.
+    """
+    _require_auth_or_skip(authorization)
+    fills, funding = _recon_store.load()
+    if symbol:
+        s = symbol.upper()
+        fills = [f for f in fills if f["symbol"] == s]
+        funding = [f for f in funding if f["symbol"] == s]
+    fills = sorted(fills, key=lambda r: r["time_ms"], reverse=True)[:limit]
+    funding = sorted(funding, key=lambda r: r["time_ms"], reverse=True)[:limit]
+    return {
+        "mode": broker_client.mode if broker_client else "none",
+        "fills": fills,
+        "funding": funding,
+        "count": len(fills),
+        "last_sync_age_s": _recon_store.last_sync_age_s(),
+    }
+
+
+@app.get("/reconciliation/summary")
+async def get_reconciliation_summary(authorization: Optional[str] = Header(None)):
+    """Reconciliation health: rates, cost drags, break counts, position parity."""
+    _require_auth_or_skip(authorization)
+    out = await _run_reconciliation()
+    return {"summary": out["summary"], "mode": broker_client.mode if broker_client else "none"}
+
+
+@app.get("/reconciliation/trades")
+async def get_reconciliation_trades(
+    limit: int = Query(100, ge=1, le=500),
+    status: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+):
+    """Reconciled round-trips (model intent × broker execution), newest first."""
+    _require_auth_or_skip(authorization)
+    out = await _run_reconciliation()
+    rows = out["trades"]
+    if status:
+        rows = [r for r in rows if r["status"] == status.upper()]
+    if severity:
+        rows = [r for r in rows if r["severity"] == severity.lower()]
+    return {"trades": rows[:limit], "count": len(rows), "summary": out["summary"]}
+
+
+@app.get("/reconciliation/breaks")
+async def get_reconciliation_breaks(authorization: Optional[str] = Header(None)):
+    """Warning+critical reconciliation items only (trades, orphans, position)."""
+    _require_auth_or_skip(authorization)
+    out = await _run_reconciliation()
+    return {"breaks": out["breaks"], "count": len(out["breaks"]), "summary": out["summary"]}
+
+
+@app.post("/reconciliation/sync")
+async def post_reconciliation_sync(authorization: Optional[str] = Header(None)):
+    """Force an immediate broker-history sync (read-only GETs against the
+    exchange; writes only the local cache). Auth-gated like all commands."""
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    result = await asyncio.to_thread(_recon_store.sync, bc)
+    return {"sync": result, "last_sync_age_s": _recon_store.last_sync_age_s()}
+
+
+@app.post("/trade")
+async def post_trade(
+    req: OrderRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """Place a real order through the configured broker (demo or paper).
+
+    For demo mode, polls for fill confirmation before returning so callers
+    get confirmed filled_qty and avg_price rather than the initial NEW status.
+    """
+    _require_auth_or_skip(authorization)
+    if (
+        kill_switch is not None
+        and not kill_switch.entries_allowed
+        and not getattr(req, "reduce_only", False)
+    ):
+        raise HTTPException(
+            status_code=423,
+            detail="Session kill switch tripped. Only reduce-only exits are allowed; re-arm or disarm to trade.",
+        )
+    bc = _broker_or_503()
+    resp = await asyncio.to_thread(bc.place_order, req)
+    result = resp.model_dump()
+
+    # Enrich with confirmed fill data when the broker supports status polling
+    if resp.broker_order_id and resp.status not in _TERMINAL_STATUSES:
+        for delay in [0.5, 1.0, 2.0]:
+            await asyncio.sleep(delay)
+            try:
+                fill = await asyncio.to_thread(bc.get_order_status, req.symbol, resp.broker_order_id)
+            except Exception:
+                break
+            if fill is None:
+                break  # paper broker
+            result["status"] = fill["status"]
+            result["filled_qty"] = fill["filled_qty"]
+            result["avg_price"] = fill["avg_price"]
+            if fill["status"] in _TERMINAL_STATUSES:
+                break
+
+    return result
+
+
+@app.post("/broker/kill-switch")
+async def post_kill_switch(
+    payload: dict,
+    authorization: Optional[str] = Header(None),
+):
+    """Arm, disarm, or re-arm the session max-loss kill switch.
+
+    Body: {"action": "arm" | "disarm" | "rearm", "limit_usdt": float (arm only)}
+    All transitions are explicit, logged as KILL_SWITCH lines, and persisted.
+    """
+    _require_auth_or_skip(authorization)
+    if kill_switch is None:
+        raise HTTPException(status_code=503, detail="Kill switch not initialized")
+    action = str(payload.get("action", "")).lower()
+    try:
+        if action == "arm":
+            kill_switch.arm(payload.get("limit_usdt"))
+        elif action == "disarm":
+            kill_switch.disarm()
+        elif action == "rearm":
+            kill_switch.rearm()
+        else:
+            raise HTTPException(status_code=400, detail=f"invalid action: {action!r}")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return _broker_summary()
+
+
+@app.post("/trade/test")
+async def post_trade_test(
+    req: OrderRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """Send the order through Binance's test endpoint (no real fill)."""
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    resp = await asyncio.to_thread(bc.place_test_order, req)
+    return resp.model_dump()
+
+
+@app.delete("/broker/order/{order_id}")
+async def delete_broker_order(
+    order_id: str,
+    symbol: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+):
+    _require_auth_or_skip(authorization)
+    bc = _broker_or_503()
+    ok = await asyncio.to_thread(bc.cancel_order, order_id, symbol)
+    return {"ok": ok, "order_id": order_id, "symbol": symbol}
+
+
+@app.websocket("/ws/signals")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for streaming trading signals to frontend."""
+    # Validate JWT from query param when AUTH_REQUIRED
+    if AUTH_REQUIRED:
+        token = websocket.scope.get("query_string", b"").decode()
+        params = dict(p.split("=", 1) for p in token.split("&") if "=" in p)
+        jwt_token = params.get("token", "")
+        if not jwt_token or not _verify_jwt(jwt_token):
+            await websocket.close(code=4001)
+            return
+    await websocket.accept()
+    active_connections.add(websocket)
+
+    logger.info(f"Client connected. Total: {len(active_connections)}")
+
+    try:
+        # Send latest data immediately
+        if latest_signal_data["timestamp"]:
+            await websocket.send_json(latest_signal_data)
+
+        while True:
+            try:
+                data = await websocket.receive_text()
+                if data == "ping":
+                    await websocket.send_json({"type": "pong"})
+                elif data == "get_latest":
+                    if latest_signal_data["timestamp"]:
+                        await websocket.send_json(latest_signal_data)
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.error(f"WS error: {e}")
+                break
+    finally:
+        active_connections.discard(websocket)
+        logger.info(f"Client disconnected. Total: {len(active_connections)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    logger.info(f"Starting {MODEL_VERSION} Model Server on http://127.0.0.1:8888")
+    uvicorn.run(app, host="0.0.0.0", port=8888, log_level="info")
